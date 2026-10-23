@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: true
+  electron-winstaller: false
+minimumReleaseAgeExclude:
+  - electron-vite@6.0.0

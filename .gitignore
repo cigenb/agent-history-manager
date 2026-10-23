@@ -1,0 +1,12 @@
+node_modules/
+out/
+release/
+*.tsbuildinfo
+AGENTS.md
+CLAUDE.md
+.claude/
+*.log
+.DS_Store
+Thumbs.db
+.appdata/
+.demo/
