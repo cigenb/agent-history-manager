@@ -13,7 +13,7 @@ export function markdownFileName(title: string): string {
 }
 
 export function exportMarkdown(detail: SessionDetail, title: string, now = new Date()): string {
-  const [product, speaker] = NAMES[detail.source ?? 'claude']
+  const [product, speaker] = NAMES[detail.source]
   const firstPrompt = detail.turns.find((turn) => turn.kind === 'user' && turn.time)
   const date = new Date(firstPrompt?.time || detail.firstTime || now.getTime())
   const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`

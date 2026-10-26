@@ -441,11 +441,31 @@ export async function loadGrokSession(
   }
 }
 
-/** A subagent's own session, started from session `v`. */
+/** Child sessions of a session's subagents, and of theirs, at any depth. */
+export async function grokDescendants(sessionDir: string): Promise<{ id: string; dir: string; parentDir: string }[]> {
+  const out: { id: string; dir: string; parentDir: string }[] = []
+  const seen = new Set<string>()
+  const queue = [sessionDir]
+  while (queue.length) {
+    const parentDir = queue.shift()!
+    for (const id of (await readGrokAgents(parentDir)).keys()) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const dir = await findGrokSessionDir(id)
+      if (!dir) continue
+      out.push({ id, dir, parentDir })
+      queue.push(dir)
+    }
+  }
+  return out
+}
+
+/** A subagent's own session anywhere below session `v`; its card comes from the session that started it. */
 export async function loadGrokAgent(v: SessionVersion, agentId: string): Promise<AgentDetail | null> {
   if (!SAFE_SEGMENT.test(v.dir) || !SAFE_SEGMENT.test(v.id)) return null
-  const run = (await readGrokAgents(grokSessionDir(v))).get(agentId)
-  const dir = run?.id ? await findGrokSessionDir(agentId) : null
+  const found = (await grokDescendants(grokSessionDir(v))).find((d) => d.id === agentId)
+  const run = found ? (await readGrokAgents(found.parentDir)).get(agentId) : undefined
+  const dir = found?.dir
   if (!run || !dir) return null
   const read = await readGrokTurns(join(dir, 'updates.jsonl'), await readGrokAgents(dir))
   return read ? { run, turns: read.turns } : null

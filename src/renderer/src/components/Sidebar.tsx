@@ -512,7 +512,7 @@ const SessionRow = memo(function SessionRow({
       ) : (
         <span className="session-title">{pending ?? (s.title || t.untitled)}</span>
       )}
-      {s.archived && <span className="origin-badge">{t.archived}</span>}
+      {s.archived && <span className="row-badge">{t.archived}</span>}
 
     </div>
   )

@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { searchTerms } from '../shared/search'
 import type { ProjectSummary, SearchHit, SearchResponse, SearchResult, SessionSource, SessionVersion } from '../shared/types'
-import { codexSearchText } from './codex'
+import { codexHistoryMarks, codexSearchText } from './codex'
 import { grokSearchText, grokUpdatesFile } from './grok'
 import {
   B_ASSISTANT,
@@ -111,8 +111,7 @@ export class SearchIndex {
   private rerun = false
 
   private fileOf(source: SessionSource, v: SessionVersion): string {
-    // A Codex version's `dir` is its rollout file, which grows with the thread.
-    if (source === 'codex') return v.dir
+    if (source === 'codex') return 'codex:' + v.id
     return source === 'grok' ? grokUpdatesFile(v) : join(PROJECTS_DIR, v.dir, v.id + '.jsonl')
   }
 
@@ -139,22 +138,25 @@ export class SearchIndex {
 
   private async refresh(projects: ProjectSummary[]): Promise<void> {
     const wanted = new Set<string>()
+    const codexMarks = projects.some((p) => p.source === 'codex') ? codexHistoryMarks() : new Map<string, number>()
     for (const p of projects) {
       for (const s of p.sessions) {
         for (const v of s.versions) {
           const file = this.fileOf(p.source, v)
           wanted.add(file)
+          if (p.source === 'codex') {
+            // Keyed on the thread's newest history row; `size` holds that mark.
+            const mark = codexMarks.get(v.id) ?? 0
+            if (this.files.get(file)?.size !== mark) this.files.set(file, textOf(codexSearchText(v.id), mark, 0))
+            continue
+          }
           try {
             const st = await fs.stat(file)
             const prev = this.files.get(file)
             if (prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) continue
             this.files.set(
               file,
-              p.source === 'grok'
-                ? await readGrokText(file, st.size, st.mtimeMs)
-                : p.source === 'codex'
-                  ? textOf(codexSearchText(v.id), st.size, st.mtimeMs)
-                  : await readFileText(file, prev, st.size, st.mtimeMs),
+              p.source === 'grok' ? await readGrokText(file, st.size, st.mtimeMs) : await readFileText(file, prev, st.size, st.mtimeMs),
             )
           } catch {
             this.files.delete(file)

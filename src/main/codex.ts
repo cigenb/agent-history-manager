@@ -29,9 +29,6 @@ function codexDb(prefix: 'state' | 'thread_history'): string | null {
   return dbs.length ? join(CODEX_HOME, dbs[0][0]) : null
 }
 
-/** The thread index database. */
-export const codexStateDb = (): string | null => codexDb('state')
-
 /** Codex records some working folders with the `\\?\` long-path prefix; compare and show them without it. */
 export function plainPath(path: string): string {
   return path.startsWith('\\\\?\\UNC\\') ? '\\\\' + path.slice(8) : path.startsWith('\\\\?\\') ? path.slice(4) : path
@@ -98,34 +95,37 @@ function openDb(prefix: 'state' | 'thread_history' = 'state'): DatabaseSync | nu
   }
 }
 
-/** Top-level threads; subagent threads carry a JSON `source` and are listed with their parent. */
-function readThreads(db: DatabaseSync): CodexThread[] {
-  const rows = db
-    .prepare(
-      `SELECT id, rollout_path, created_at, updated_at, source, cwd, title, first_user_message, archived
-       FROM threads WHERE source NOT LIKE '{%'`,
-    )
-    .all() as {
-    id: string
-    rollout_path: string
-    created_at: number
-    updated_at: number
-    source: string
-    cwd: string
-    title: string | null
-    first_user_message: string | null
-    archived: number
-  }[]
-  return rows.map((r) => ({
+const THREAD_COLUMNS = 'id, rollout_path, created_at, updated_at, source, cwd, title, first_user_message, archived'
+
+interface ThreadRow {
+  id: string
+  rollout_path: string
+  created_at: number
+  updated_at: number
+  source: string
+  cwd: string
+  title: string | null
+  first_user_message: string | null
+  archived: number
+}
+
+function rowToThread(r: ThreadRow): CodexThread {
+  return {
     id: r.id,
-    rolloutPath: r.rollout_path,
+    rolloutPath: r.rollout_path ?? '',
     created: r.created_at * 1000,
     updated: r.updated_at * 1000,
     source: r.source,
-    cwd: plainPath(r.cwd),
+    cwd: plainPath(r.cwd ?? ''),
     title: codexRequest(r.title || r.first_user_message || '').split('\n')[0].trim().slice(0, 120),
     archived: !!r.archived,
-  }))
+  }
+}
+
+/** Top-level threads; subagent threads carry a JSON `source` and are listed with their parent. */
+function readThreads(db: DatabaseSync): CodexThread[] {
+  const rows = db.prepare(`SELECT ${THREAD_COLUMNS} FROM threads WHERE source NOT LIKE '{%'`).all() as unknown as ThreadRow[]
+  return rows.map(rowToThread)
 }
 
 /** Every subagent thread below the given threads, at any depth. */
@@ -137,7 +137,7 @@ export function codexDescendants(ids: string[]): CodexThread[] {
     const seen = new Set(ids)
     let frontier = ids
     const edges = db.prepare('SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ?')
-    const row = db.prepare('SELECT id, rollout_path, created_at, updated_at, source, cwd, title, archived FROM threads WHERE id = ?')
+    const row = db.prepare(`SELECT ${THREAD_COLUMNS} FROM threads WHERE id = ?`)
     while (frontier.length) {
       const next: string[] = []
       for (const id of frontier) {
@@ -145,19 +145,8 @@ export function codexDescendants(ids: string[]): CodexThread[] {
           if (seen.has(child)) continue
           seen.add(child)
           next.push(child)
-          const r = row.get(child) as Record<string, unknown> | undefined
-          if (r) {
-            out.push({
-              id: child,
-              rolloutPath: String(r.rollout_path ?? ''),
-              created: Number(r.created_at) * 1000,
-              updated: Number(r.updated_at) * 1000,
-              source: String(r.source ?? ''),
-              cwd: plainPath(String(r.cwd ?? '')),
-              title: String(r.title ?? ''),
-              archived: !!r.archived,
-            })
-          }
+          const r = row.get(child) as ThreadRow | undefined
+          if (r) out.push(rowToThread(r))
         }
       }
       frontier = next
@@ -172,7 +161,8 @@ export function codexThread(id: string): CodexThread | null {
   const db = openDb()
   if (!db) return null
   try {
-    return readThreads(db).find((t) => t.id === id) ?? null
+    const r = db.prepare(`SELECT ${THREAD_COLUMNS} FROM threads WHERE id = ?`).get(id) as ThreadRow | undefined
+    return r ? rowToThread(r) : null
   } finally {
     db.close()
   }
@@ -224,8 +214,7 @@ export async function scanCodex(): Promise<ProjectSummary[]> {
     }
     let g = groups.get(key)
     if (!g) groups.set(key, (g = { ...group, sessions: [] }))
-    // `dir` holds the rollout file, which content search watches for changes.
-    const version: SessionVersion = { id: t.id, dir: t.rolloutPath, title: names.get(t.id) || t.title, lastActivity: t.updated, promptCount: 0 }
+    const version: SessionVersion = { id: t.id, dir: '', title: names.get(t.id) || t.title, lastActivity: t.updated, promptCount: 0 }
     g.sessions.push({
       ...version,
       projectKey: key,
@@ -321,6 +310,10 @@ function codexAgentRuns(parentId: string): Map<string, AgentRun> {
          WHERE e.parent_thread_id = ?`,
       )
       .all(parentId) as { id: string; source: string; model: string | null }[]
+    const lastTurn = history?.prepare('SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1')
+    const toolCalls = history?.prepare(
+      `SELECT COUNT(*) AS n FROM thread_items WHERE thread_id = ? AND item_type IN (${[...TOOL_ITEMS].map(() => '?').join(', ')})`,
+    )
     for (const c of children) {
       let spawn: { agent_path?: string | null; agent_nickname?: string | null; agent_role?: string | null } = {}
       try {
@@ -328,17 +321,15 @@ function codexAgentRuns(parentId: string): Map<string, AgentRun> {
       } catch {
         /* not JSON */
       }
-      const last = history?.prepare('SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1').get(c.id) as
-        | { status: string }
-        | undefined
-      const items = history?.prepare('SELECT item_type FROM thread_items WHERE thread_id = ?').all(c.id) as { item_type: string }[] | undefined
+      const last = lastTurn?.get(c.id) as { status: string } | undefined
+      const calls = toolCalls?.get(c.id, ...TOOL_ITEMS) as { n: number } | undefined
       out.set(c.id, {
         id: c.id,
         description: spawn.agent_path?.split('/').pop() || spawn.agent_nickname || '',
         type: spawn.agent_role || spawn.agent_nickname || 'subagent',
         model: c.model ?? undefined,
         state: last?.status === 'completed' ? 'done' : last && last.status !== 'inProgress' ? 'stopped' : 'open',
-        toolCalls: items?.filter((i) => TOOL_ITEMS.has(i.item_type)).length ?? 0,
+        toolCalls: calls?.n ?? 0,
       })
     }
   } catch {
@@ -355,7 +346,11 @@ function codexAgentRuns(parentId: string): Map<string, AgentRun> {
  * and per turn the `final_answer` message with the `commentary` messages before it as steps. A turn that starts
  * without a prompt (a subagent reporting back, a queued follow-up) gets a `resume` marker.
  */
-export function readCodexTurns(threadId: string, images = true): { turns: Turn[]; firstTime: number; lastTime: number } | null {
+function readCodexTurns(
+  threadId: string,
+  images = true,
+  agents?: Map<string, AgentRun>,
+): { turns: Turn[]; firstTime: number; lastTime: number } | null {
   const db = openDb('thread_history')
   if (!db) return null
   let rows: ItemRow[]
@@ -368,7 +363,7 @@ export function readCodexTurns(threadId: string, images = true): { turns: Turn[]
   } finally {
     db.close()
   }
-  const agents = codexAgentRuns(threadId)
+  agents ??= codexAgentRuns(threadId)
   const turns: Turn[] = []
   let firstTime = 0
   let lastTime = 0
@@ -446,7 +441,7 @@ export function readCodexTurns(threadId: string, images = true): { turns: Turn[]
         const id = item.agentThreadId
         if (!id || seenAgents.has(id)) break
         seenAgents.add(id)
-        open(ts).agents.push(agents.get(id) ?? { id: null, description: '', type: 'subagent', state: 'open', toolCalls: 0 })
+        open(ts).agents.push(agents!.get(id) ?? { id: null, description: '', type: 'subagent', state: 'open', toolCalls: 0 })
         break
       }
       case 'contextCompaction':
@@ -476,17 +471,51 @@ export function loadCodexSession(project: ProjectSummary, family: SessionSummary
   }
 }
 
-/** A subagent thread started by thread `parentId`. */
-export function loadCodexAgent(parentId: string, agentId: string): AgentDetail | null {
-  const run = codexAgentRuns(parentId).get(agentId)
+/** A subagent thread anywhere below thread `rootId`; its card comes from the thread that started it. */
+export function loadCodexAgent(rootId: string, agentId: string): AgentDetail | null {
+  const db = openDb()
+  let parent: string | undefined
+  try {
+    const below = new Set(codexDescendants([rootId]).map((t) => t.id))
+    const edge = below.has(agentId)
+      ? (db?.prepare('SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id = ?').get(agentId) as { parent_thread_id: string } | undefined)
+      : undefined
+    parent = edge?.parent_thread_id
+  } finally {
+    db?.close()
+  }
+  const run = parent ? codexAgentRuns(parent).get(agentId) : undefined
   const read = run ? readCodexTurns(agentId) : null
   return run && read ? { run, turns: read.turns } : null
+}
+
+/**
+ * Newest history row per thread. Search keys its cached text on this rather than on the rollout file, because
+ * the text comes from the history projection, which can lag behind the rollout.
+ */
+export function codexHistoryMarks(): Map<string, number> {
+  const out = new Map<string, number>()
+  const db = openDb('thread_history')
+  if (!db) return out
+  try {
+    for (const r of db.prepare('SELECT thread_id, MAX(rollout_ordinal) AS n FROM thread_items GROUP BY thread_id').all() as {
+      thread_id: string
+      n: number
+    }[]) {
+      out.set(r.thread_id, r.n)
+    }
+  } catch {
+    /* schema changed */
+  } finally {
+    db.close()
+  }
+  return out
 }
 
 /** Prompts and answer text of a thread, the same text the viewer shows, for content search. */
 export function codexSearchText(threadId: string): string[] {
   const out: string[] = []
-  for (const t of readCodexTurns(threadId, false)?.turns ?? []) {
+  for (const t of readCodexTurns(threadId, false, new Map())?.turns ?? []) {
     if (t.kind === 'user' && t.text) out.push(t.text)
     else if (t.kind === 'assistant') out.push(...t.steps, ...(t.text ? [t.text] : []))
   }

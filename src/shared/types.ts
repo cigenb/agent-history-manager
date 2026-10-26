@@ -4,7 +4,7 @@ export type SessionSource = 'claude' | 'codex' | 'grok'
 /** One session file. */
 export interface SessionVersion {
   id: string
-  /** Claude: folder under ~/.claude/projects holding `<id>.jsonl`. Grok: folder under ~/.grok/sessions holding `<id>/` */
+  /** Claude: folder under ~/.claude/projects holding `<id>.jsonl`. Grok: folder under ~/.grok/sessions holding `<id>/`. Codex: empty */
   dir: string
   title: string
   /** Epoch ms of the last user/assistant record */

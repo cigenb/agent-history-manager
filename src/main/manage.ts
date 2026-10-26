@@ -25,7 +25,7 @@ import {
   readGlobalState,
   type CodexThread,
 } from './codex'
-import { findGrokSessionDir, GROK_HOME, grokExecutable, grokSessionDir, isGrokKey, readGrokAgents } from './grok'
+import { GROK_HOME, grokDescendants, grokExecutable, grokSessionDir, isGrokKey } from './grok'
 import { findSession, projectMemoryDir, PROJECTS_DIR } from './sessions'
 
 const CLAUDE_DIR = join(homedir(), '.claude')
@@ -278,8 +278,9 @@ async function grokSessionBusy(id: string): Promise<boolean> {
   let data: unknown
   try {
     data = JSON.parse(await fs.readFile(join(GROK_HOME, 'active_sessions.json'), 'utf8'))
-  } catch {
-    return false
+  } catch (e) {
+    // No file: no session is open. A file Grok is rewriting can't be read: assume the session may be open.
+    return (e as NodeJS.ErrnoException).code !== 'ENOENT'
   }
   const rows: [string, unknown][] = Array.isArray(data)
     ? data.map((v) => ['', v])
@@ -304,17 +305,12 @@ function run(file: string, args: string[]): Promise<{ code: number; stdout: stri
 
 const lastLine = (text: string): string => text.trim().split(/\r?\n/).pop() ?? ''
 
-/** Sessions to delete, each with the child sessions of its subagents; recomputed for every run. */
+/** Sessions to delete, each with the child sessions of its subagents at any depth; recomputed for every run. */
 async function grokTargets(projects: ProjectSummary[], target: DeleteTarget) {
   const out: { id: string; dir: string; children: { id: string; dir: string }[] }[] = []
   for (const v of targetVersions(projects, target)) {
     const dir = grokSessionDir(v)
-    const children: { id: string; dir: string }[] = []
-    for (const id of (await readGrokAgents(dir)).keys()) {
-      const childDir = await findGrokSessionDir(id)
-      if (childDir) children.push({ id, dir: childDir })
-    }
-    out.push({ id: v.id, dir, children })
+    out.push({ id: v.id, dir, children: await grokDescendants(dir) })
   }
   return out
 }
@@ -340,12 +336,16 @@ async function runGrokDelete(projects: ProjectSummary[], target: DeleteTarget): 
   }
   const failures: string[] = []
   for (const session of sessions) {
-    for (const s of [session, ...session.children]) {
-      const r = await run(grokExecutable(), ['sessions', 'delete', s.id])
-      if (!existsSync(s.dir)) continue
+    const r = await run(grokExecutable(), ['sessions', 'delete', session.id])
+    if (existsSync(session.dir)) {
+      // The parent is still there: keep its subagents' sessions with it.
+      failures.push(lastLine(r.stderr || r.stdout) || session.dir)
+      continue
+    }
+    for (const c of session.children) {
+      await run(grokExecutable(), ['sessions', 'delete', c.id])
       // The CLI skips the local folders of hidden subagent sessions; those go to the Recycle Bin instead.
-      if (s === session) failures.push(lastLine(r.stderr || r.stdout) || s.dir)
-      else await shell.trashItem(s.dir).catch(() => failures.push(s.dir))
+      if (existsSync(c.dir)) await shell.trashItem(c.dir).catch(() => failures.push(c.dir))
     }
   }
   return failures.length ? { ok: false, error: { code: 'grok-failed', detail: failures.join('\n') } } : { ok: true }
@@ -392,7 +392,9 @@ function codexDeleteThreads(ids: string[]): Promise<string[]> {
       windowsHide: true,
     })
     const waiting = new Map<number, (m: RpcMessage) => void>()
+    let dead: string | null = null
     const fail = (reason: string) => {
+      dead ??= reason
       for (const done of waiting.values()) done({ error: { message: reason } })
       waiting.clear()
     }
@@ -424,6 +426,7 @@ function codexDeleteThreads(ids: string[]): Promise<string[]> {
     let seq = 0
     const call = (method: string, params: unknown) =>
       new Promise<RpcMessage>((done) => {
+        if (dead) return done({ error: { message: dead } })
         const id = ++seq
         waiting.set(id, done)
         child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
@@ -441,6 +444,7 @@ function codexDeleteThreads(ids: string[]): Promise<string[]> {
         for (const id of ids) {
           const r = await call('thread/delete', { threadId: id })
           if (r.error) failures.push(`${id}: ${r.error.message ?? 'failed'}`)
+          if (dead) break
         }
       }
       clearTimeout(timer)
@@ -499,12 +503,8 @@ async function planCodexDelete(
   const all = threads.map((t) => t.id)
   const state = await readGlobalState()
   const items: DeleteItem[] = []
-  for (const t of threads) {
-    if (t.rolloutPath) {
-      const bytes = await sizeOf(t.rolloutPath)
-      if (bytes !== null) items.push({ path: t.rolloutPath, bytes, kind: 'sessions' })
-    }
-  }
+  // Listed even when the rollout file is gone: the thread's index rows still need thread/delete.
+  for (const t of threads) items.push({ path: t.rolloutPath || t.id, bytes: (t.rolloutPath && (await sizeOf(t.rolloutPath))) || 0, kind: 'sessions' })
   if (forgetThreads(state, all).removed) items.push({ path: CODEX_GLOBAL_STATE, bytes: 0, kind: 'sessions' })
   const files: DeleteItem[] = []
   for (const id of all) {
@@ -518,7 +518,8 @@ async function planCodexDelete(
   for (const id of top) {
     const dir = outputs[id]
     if (!dir || !(state['projectless-thread-ids'] ?? []).includes(id)) continue
-    const shared = remaining.some((s) => outputs[s.id] && outputs[s.id].toLowerCase() === dir.toLowerCase())
+    const same = (other: string | undefined) => other?.toLowerCase() === dir.toLowerCase()
+    const shared = remaining.some((s) => same(outputs[s.id])) || files.some((f) => same(f.path))
     const bytes = shared ? null : await sizeOf(dir)
     if (bytes !== null) files.push({ path: dir, bytes, kind: 'output' })
   }
@@ -533,8 +534,9 @@ async function runCodexDelete(projects: ProjectSummary[], target: DeleteTarget, 
   const failures: string[] = []
   if (kinds.includes('sessions') && top.length) {
     failures.push(...(await codexDeleteThreads(top)))
-    // Desktop's entries go only once Codex has deleted the threads themselves.
-    if (!failures.length) failures.push(...(await forgetCodexThreads(all)))
+    // Desktop's entries and the threads' files go only once Codex has deleted the threads themselves.
+    if (failures.length) return { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } }
+    failures.push(...(await forgetCodexThreads(all)))
   }
   for (const { path } of files.filter((f) => kinds.includes(f.kind))) {
     await shell.trashItem(path).catch(() => failures.push(path))

@@ -10,7 +10,7 @@ import { Store } from '../src/main/store.ts'
 
 const time = new Date(2026, 0, 2, 12).getTime()
 const conversation = (turns) => ({
-  id: 'example-version', familyId: 'example-family', projectKey: '/example',
+  source: 'claude', id: 'example-version', familyId: 'example-family', projectKey: '/example',
   path: '/example/project', versions: [], firstTime: time - 86_400_000, lastTime: time, turns,
 })
 

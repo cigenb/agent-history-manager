@@ -102,6 +102,7 @@ test('builds prompts, final answers, steps, subagents and MCP calls from Codex h
   assert.ok(!JSON.stringify(turns).includes('hidden thinking'))
   const agent = loadCodexAgent('assigned', 'child')
   assert.equal(agent.turns.at(-1).text, 'Docs ok')
+  assert.equal(loadCodexAgent('assigned', 'grandchild').run.id, 'grandchild')
   assert.equal(loadCodexAgent('by-root', 'child'), null)
 })
 
