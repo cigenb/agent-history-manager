@@ -16,7 +16,17 @@ import type {
 } from '../shared/types'
 import { CODEX_HOME, isCodexKey, loadCodexAgent, loadCodexSession, scanCodex } from './codex'
 import { GROK_SESSIONS_DIR, GrokIndex, isGrokKey, loadGrokAgent, loadGrokSession } from './grok'
-import { LIVE_SESSIONS_DIR, liveSessionIds, liveSessions, openInTerminal, openProjectInTerminal, planDelete, renameSession, runDelete } from './manage'
+import {
+  LIVE_SESSIONS_DIR,
+  liveSessionIds,
+  liveSessions,
+  onDeleteProgress,
+  openInTerminal,
+  openProjectInTerminal,
+  planDelete,
+  renameSession,
+  runDelete,
+} from './manage'
 import { getProjectMemory, listMemoryBackups, planMemoryDelete, restoreMemoryBackup, runMemoryDelete } from './memory'
 import { SearchIndex } from './search'
 import { findSession, loadAgent, loadSession, PROJECTS_DIR, SessionIndex } from './sessions'
@@ -260,6 +270,7 @@ const memoryBackupRoot = () => join(app.getPath('userData'), 'memory-backups')
 const deletedNote = () => DELETED_NOTES[store.getUi(app.getLocale()).language ?? 'en']
 
 function registerIpc(): void {
+  onDeleteProgress((done, total) => win?.webContents.send('delete:progress', done, total))
   ipcMain.handle('projects:list', async () => {
     const [claude, codex, grok] = await Promise.all([index.scan(), scanCodex(), grokIndex.scan()])
     lastProjects = [...claude, ...codex, ...grok]

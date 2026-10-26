@@ -2,7 +2,7 @@ import { app, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, promises as fs } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type {
   ActionResult,
   ActionError,
@@ -22,10 +22,14 @@ import {
   codexThread,
   forgetThreads,
   isCodexKey,
+  codexRolloutFiles,
+  codexThreadsIn,
+  projectlessWorkspaces,
   readGlobalState,
+  scanCodexResidue,
   type CodexThread,
 } from './codex'
-import { GROK_HOME, grokDescendants, grokExecutable, grokSessionDir, isGrokKey } from './grok'
+import { GROK_HOME, grokDescendants, grokExecutable, grokSessionDir, isGrokKey, scanGrokResidue } from './grok'
 import { findSession, projectMemoryDir, PROJECTS_DIR } from './sessions'
 
 const CLAUDE_DIR = join(homedir(), '.claude')
@@ -77,6 +81,35 @@ export async function liveSessionIds(): Promise<Set<string>> {
 
 const OPEN_ERROR: ActionError = { code: 'session-open' }
 
+let reportProgress: (done: number, total: number) => void = () => {}
+
+/** Receives how many of the paths of the running deletion have been handled. */
+export function onDeleteProgress(cb: (done: number, total: number) => void): void {
+  reportProgress = cb
+}
+
+/**
+ * Moves paths to the Recycle Bin a few at a time (each move takes a fraction of a second, and a leftover check
+ * can list hundreds), reporting progress. Folders emptied by it are removed afterwards when `pruneParents` is set;
+ * rmdir refuses a folder that still has files. Returns the paths that could not be moved.
+ */
+async function trashPaths(paths: string[], pruneParents = false): Promise<string[]> {
+  const failed: string[] = []
+  let next = 0
+  let done = 0
+  reportProgress(0, paths.length)
+  const worker = async () => {
+    while (next < paths.length) {
+      const path = paths[next++]
+      await shell.trashItem(path).catch(() => failed.push(path))
+      reportProgress(++done, paths.length)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(6, paths.length) }, worker))
+  if (pruneParents) for (const dir of new Set(paths.map((p) => dirname(p)))) await fs.rmdir(dir).catch(() => undefined)
+  return failed
+}
+
 async function sizeOf(path: string): Promise<number | null> {
   let st
   try {
@@ -120,6 +153,10 @@ function targetVersions(projects: ProjectSummary[], target: DeleteTarget): Sessi
 
 export async function planDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<DeletePlan> {
   if (isGrokKey(target.projectKey)) return planGrokDelete(projects, target)
+  if (target.kind === 'residue') {
+    if (isGrokKey(target.projectKey)) return (await planGrokResidue(projects)).plan
+    return isCodexKey(target.projectKey) ? (await planCodexResidue()).plan : (await planClaudeResidue(projects)).plan
+  }
   if (isCodexKey(target.projectKey)) return (await planCodexDelete(projects, target)).plan
   const versions = targetVersions(projects, target)
   const live = await liveSessionIds()
@@ -140,17 +177,14 @@ export async function runDelete(
   kinds: DeleteKind[],
 ): Promise<ActionResult> {
   if (isGrokKey(target.projectKey)) return runGrokDelete(projects, target)
+  if (target.kind === 'residue') {
+    if (isGrokKey(target.projectKey)) return runGrokResidue(projects, kinds)
+    return isCodexKey(target.projectKey) ? runCodexResidue(kinds) : runClaudeResidue(projects, kinds)
+  }
   if (isCodexKey(target.projectKey)) return runCodexDelete(projects, target, kinds)
   const plan = await planDelete(projects, target)
   if (plan.blocked) return { ok: false, error: plan.blocked }
-  const failed: string[] = []
-  for (const { path } of plan.items.filter((i) => kinds.includes(i.kind))) {
-    try {
-      await shell.trashItem(path)
-    } catch {
-      failed.push(path)
-    }
-  }
+  const failed = await trashPaths(plan.items.filter((i) => kinds.includes(i.kind)).map((i) => i.path))
   return failed.length ? { ok: false, error: { code: 'trash-failed', files: failed } } : { ok: true }
 }
 
@@ -454,6 +488,14 @@ function codexDeleteThreads(ids: string[]): Promise<string[]> {
   })
 }
 
+/** Images and working folders; a date folder of projectless workspaces emptied by this goes too. */
+async function trashFolders(folders: { path: string; kind: DeleteKind }[]): Promise<string[]> {
+  return [
+    ...(await trashPaths(folders.filter((f) => f.kind !== 'output').map((f) => f.path))),
+    ...(await trashPaths(folders.filter((f) => f.kind === 'output').map((f) => f.path), true)),
+  ]
+}
+
 const backupRoot = () => join(app.getPath('userData'), 'codex-backups', new Date().toISOString().replace(/[:.]/g, '-'))
 
 /**
@@ -497,7 +539,7 @@ async function forgetCodexThreads(ids: string[]): Promise<string[]> {
 async function planCodexDelete(
   projects: ProjectSummary[],
   target: DeleteTarget,
-): Promise<{ plan: DeletePlan; top: string[]; all: string[]; files: DeleteItem[] }> {
+): Promise<{ plan: DeletePlan; top: string[]; all: string[]; files: DeleteItem[]; extra: string[] }> {
   const top = targetVersions(projects, target).map((v) => v.id)
   const threads = [...top.map(codexThread).filter((t): t is CodexThread => !!t), ...codexDescendants(top)]
   const all = threads.map((t) => t.id)
@@ -505,6 +547,15 @@ async function planCodexDelete(
   const items: DeleteItem[] = []
   // Listed even when the rollout file is gone: the thread's index rows still need thread/delete.
   for (const t of threads) items.push({ path: t.rolloutPath || t.id, bytes: (t.rolloutPath && (await sizeOf(t.rolloutPath))) || 0, kind: 'sessions' })
+  // Further rollout files named after these threads (`<thread>_<other>`); whatever thread/delete leaves of them is
+  // moved to the Recycle Bin afterwards.
+  const own = new Set(threads.map((t) => t.rolloutPath.toLowerCase()))
+  const ids = new Set(all)
+  // Never one whose second id is a thread of its own.
+  const extra = (await codexRolloutFiles())
+    .filter((f) => ids.has(f.id) && !own.has(f.path.toLowerCase()) && !(f.other && codexThread(f.other)))
+    .map((f) => f.path)
+  for (const path of extra) items.push({ path, bytes: (await sizeOf(path)) ?? 0, kind: 'sessions' })
   if (forgetThreads(state, all).removed) items.push({ path: CODEX_GLOBAL_STATE, bytes: 0, kind: 'sessions' })
   const files: DeleteItem[] = []
   for (const id of all) {
@@ -513,23 +564,22 @@ async function planCodexDelete(
     if (bytes !== null) files.push({ path: images, bytes, kind: 'artifacts' })
   }
   // A projectless thread works in a folder Desktop created for it alone; never one another thread still uses.
-  const outputs = state['thread-projectless-output-directories'] ?? {}
-  const remaining = projects.flatMap((p) => (p.source === 'codex' ? p.sessions : [])).filter((s) => !top.includes(s.id))
-  for (const id of top) {
-    const dir = outputs[id]
-    if (!dir || !(state['projectless-thread-ids'] ?? []).includes(id)) continue
-    const same = (other: string | undefined) => other?.toLowerCase() === dir.toLowerCase()
-    const shared = remaining.some((s) => same(outputs[s.id])) || files.some((f) => same(f.path))
-    const bytes = shared ? null : await sizeOf(dir)
+  const workspaces = await projectlessWorkspaces(state)
+  const deleting = new Set(all)
+  for (const t of threads) {
+    const dir = workspaces.contains(t.cwd)
+    if (!dir || files.some((f) => f.path.toLowerCase() === dir.toLowerCase())) continue
+    const others = codexThreadsIn(dir).filter((id) => !deleting.has(id))
+    const bytes = others.length ? null : await sizeOf(dir)
     if (bytes !== null) files.push({ path: dir, bytes, kind: 'output' })
   }
   items.push(...files)
   const blocked: ActionError | undefined = (await codexDesktopRunning()) ? { code: 'codex-running' } : undefined
-  return { plan: { items, blocked, mode: 'codex' }, top, all, files }
+  return { plan: { items, blocked, mode: 'codex' }, top, all, files, extra }
 }
 
 async function runCodexDelete(projects: ProjectSummary[], target: DeleteTarget, kinds: DeleteKind[]): Promise<ActionResult> {
-  const { plan, top, all, files } = await planCodexDelete(projects, target)
+  const { plan, top, all, files, extra } = await planCodexDelete(projects, target)
   if (plan.blocked) return { ok: false, error: plan.blocked }
   const failures: string[] = []
   if (kinds.includes('sessions') && top.length) {
@@ -537,9 +587,169 @@ async function runCodexDelete(projects: ProjectSummary[], target: DeleteTarget, 
     // Desktop's entries and the threads' files go only once Codex has deleted the threads themselves.
     if (failures.length) return { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } }
     failures.push(...(await forgetCodexThreads(all)))
+    for (const path of extra.filter((x) => existsSync(x))) await shell.trashItem(path).catch(() => failures.push(path))
   }
-  for (const { path } of files.filter((f) => kinds.includes(f.kind))) {
-    await shell.trashItem(path).catch(() => failures.push(path))
-  }
+  failures.push(...(await trashFolders(files.filter((f) => kinds.includes(f.kind)))))
   return failures.length ? { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } } : { ok: true }
+}
+
+/**
+ * Leftovers of threads that are no longer listed: rollout files Codex has no index row for (deleted through
+ * thread/delete, which also removes their history and log rows), Desktop state entries of deleted threads, and
+ * their output folders and generated images (to the Recycle Bin). Each kind can be kept.
+ */
+async function planCodexResidue() {
+  const residue = await scanCodexResidue()
+  // A thread being created may be written before Codex indexes it.
+  const fresh = async <T extends { path: string }>(xs: T[]) => {
+    const out: T[] = []
+    for (const x of xs) if (!(await recentlyUsed(x.path))) out.push(x)
+    return out
+  }
+  residue.rollouts = await fresh(residue.rollouts)
+  residue.folders = await fresh(residue.folders)
+  const items: DeleteItem[] = []
+  for (const r of residue.rollouts) items.push({ path: r.path, bytes: (await sizeOf(r.path)) ?? 0, kind: 'sessions' })
+  if (residue.stateIds.length) items.push({ path: CODEX_GLOBAL_STATE, bytes: 0, kind: 'cache' })
+  for (const f of residue.folders) items.push({ path: f.path, bytes: (await sizeOf(f.path)) ?? 0, kind: f.kind })
+  const blocked: ActionError | undefined = (await codexDesktopRunning()) ? { code: 'codex-running' } : undefined
+  return { plan: { items, blocked, mode: 'codex' } as DeletePlan, residue }
+}
+
+async function runCodexResidue(kinds: DeleteKind[]): Promise<ActionResult> {
+  const { plan, residue } = await planCodexResidue()
+  if (plan.blocked) return { ok: false, error: plan.blocked }
+  const failures: string[] = []
+  const forget = kinds.includes('cache') ? [...residue.stateIds] : []
+  if (kinds.includes('sessions') && residue.rollouts.length) {
+    const failed = await codexDeleteThreads(residue.rollouts.map((r) => r.id))
+    failures.push(...failed)
+    // A deleted rollout's thread may still be named in Desktop's state.
+    if (kinds.includes('cache')) forget.push(...residue.rollouts.map((r) => r.id).filter((id) => !failed.some((f) => f.startsWith(id))))
+  }
+  if (forget.length) failures.push(...(await forgetCodexThreads(forget)))
+  failures.push(...(await trashFolders(residue.folders.filter((x) => kinds.includes(x.kind)))))
+  return failures.length ? { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } } : { ok: true }
+}
+
+/**
+ * Grok session folders the list does not show (see scanGrokResidue). They hold no listed conversation, so they go
+ * to the Recycle Bin instead of `grok sessions delete`; sessions open in Grok are left out.
+ */
+async function planGrokResidue(projects: ProjectSummary[]) {
+  const listed = new Set(projects.filter((p) => p.source === 'grok').flatMap((p) => p.sessions.map((s) => s.id)))
+  const folders = []
+  for (const f of await scanGrokResidue(listed)) if (!(await grokSessionBusy(f.id)) && !(await recentlyUsed(f.path))) folders.push(f)
+  const items: DeleteItem[] = []
+  for (const f of folders) items.push({ path: f.path, bytes: (await sizeOf(f.path)) ?? 0, kind: f.kind })
+  return { plan: { items } as DeletePlan, folders }
+}
+
+async function runGrokResidue(projects: ProjectSummary[], kinds: DeleteKind[]): Promise<ActionResult> {
+  const { folders } = await planGrokResidue(projects)
+  // The working-folder level under ~/.grok/sessions goes too once its last session is gone.
+  const failures = await trashPaths(folders.filter((x) => kinds.includes(x.kind)).map((f) => f.path), true)
+  return failures.length ? { ok: false, error: { code: 'trash-failed', files: failures } } : { ok: true }
+}
+
+// ---- Claude Code leftovers ---------------------------------------------------
+
+const RECENT_MS = 24 * 3_600_000
+
+async function hasReply(file: string): Promise<boolean> {
+  try {
+    return (await fs.readFile(file)).includes('"type":"assistant"')
+  } catch {
+    return true
+  }
+}
+
+/** Whether the path, or anything up to two levels inside it, changed within RECENT_MS. */
+async function recentlyUsed(path: string, depth = 2): Promise<boolean> {
+  try {
+    const st = await fs.lstat(path)
+    if (Date.now() - st.mtimeMs < RECENT_MS) return true
+    if (!st.isDirectory() || depth === 0) return false
+    for (const e of await fs.readdir(path)) if (await recentlyUsed(join(path, e), depth - 1)) return true
+  } catch {
+    /* gone or unreadable */
+  }
+  return false
+}
+
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+async function dirNames(path: string): Promise<string[]> {
+  try {
+    return (await fs.readdir(path, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Files the list does not account for: session files without a prompt (with everything versionPaths names for
+ * them), and per-session folders whose session file is gone: subagent and tool output, /rewind backups,
+ * session-env, temporary workspaces. Project folders without any session are listed too; their memory starts
+ * unchecked. Sessions open in Claude Code are skipped.
+ */
+async function planClaudeResidue(projects: ProjectSummary[]) {
+  const listed = new Set(projects.filter((p) => p.source === 'claude').flatMap((p) => p.sessions.flatMap((s) => s.versions.map((v) => v.id))))
+  const live = await liveSessionIds()
+  const known = new Set<string>()
+  /** Project folders with a session open in Claude Code */
+  const liveDirs = new Set<string>()
+  const paths: { path: string; kind: DeleteKind }[] = []
+  for (const dir of await dirNames(PROJECTS_DIR)) {
+    let names: string[]
+    try {
+      names = await fs.readdir(join(PROJECTS_DIR, dir))
+    } catch {
+      continue
+    }
+    const ids = names.filter((n) => n.endsWith('.jsonl')).map((n) => n.slice(0, -6))
+    for (const id of ids) known.add(id)
+    if (ids.some((id) => live.has(id))) liveDirs.add(dir.toLowerCase())
+    if (!ids.length) {
+      // A project without sessions: only its memory has value, so that starts unchecked.
+      for (const n of names) paths.push({ path: join(PROJECTS_DIR, dir, n), kind: n === 'memory' ? 'memory' : 'artifacts' })
+      continue
+    }
+    for (const id of ids) {
+      // Unlisted because no prompt was typed; one Claude answered (a slash command or skill run) is a conversation.
+      if (!listed.has(id) && !live.has(id) && !(await hasReply(join(PROJECTS_DIR, dir, id + '.jsonl')))) {
+        paths.push(...versionPaths({ id, dir, title: '', lastActivity: 0, promptCount: 0 }))
+      }
+    }
+    for (const n of names) {
+      if (SESSION_ID.test(n) && !ids.includes(n)) paths.push({ path: join(PROJECTS_DIR, dir, n), kind: 'artifacts' })
+    }
+  }
+  const orphan = (id: string) => SESSION_ID.test(id) && !known.has(id) && !live.has(id)
+  for (const id of (await dirNames(join(CLAUDE_DIR, 'file-history'))).filter(orphan)) paths.push({ path: join(CLAUDE_DIR, 'file-history', id), kind: 'history' })
+  for (const id of (await dirNames(join(CLAUDE_DIR, 'session-env'))).filter(orphan)) paths.push({ path: join(CLAUDE_DIR, 'session-env', id), kind: 'artifacts' })
+  const temp = join(tmpdir(), 'claude')
+  for (const dir of await dirNames(temp)) {
+    // A running Claude Code keeps its own temporary folder under an id that is not its transcript's after a
+    // resume, so nothing in the project folder of an open session counts as left over.
+    if (liveDirs.has(dir.toLowerCase())) continue
+    for (const id of (await dirNames(join(temp, dir))).filter(orphan)) paths.push({ path: join(temp, dir, id), kind: 'temp' })
+  }
+  const seen = new Set<string>()
+  const unique: typeof paths = []
+  for (const p of paths) {
+    if (seen.has(p.path.toLowerCase())) continue
+    seen.add(p.path.toLowerCase())
+    // Anything touched in the last day may belong to a session that is starting or still running.
+    if (!(await recentlyUsed(p.path))) unique.push(p)
+  }
+  const items = await existing(unique)
+  return { plan: { items, unchecked: ['memory'] } as DeletePlan, items }
+}
+
+async function runClaudeResidue(projects: ProjectSummary[], kinds: DeleteKind[]): Promise<ActionResult> {
+  const { items } = await planClaudeResidue(projects)
+  // A project or temp-workspace folder emptied by this goes too.
+  const failed = await trashPaths(items.filter((i) => kinds.includes(i.kind)).map((i) => i.path), true)
+  return failed.length ? { ok: false, error: { code: 'trash-failed', files: failed } } : { ok: true }
 }

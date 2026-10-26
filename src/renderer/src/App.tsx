@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DeleteKind, DeleteTarget, DocEdit, LiveSessions, ProjectSummary, SearchHit, SessionDetail, SessionSummary, UiState } from '../../shared/types'
 import ChatView, { type SearchFocus } from './components/ChatView'
 import DeleteDialog, { type DeleteRequest } from './dialogs/DeleteDialog'
-import { Download, PanelLeft, PanelRight } from './components/Icons'
+import { Broom, Download, PanelLeft, PanelRight } from './components/Icons'
 import RightBar, { type PanelView } from './components/RightBar'
 import MemoryPanel from './memory/MemoryPanel'
 import { CopyButton } from './components/Markdown'
@@ -275,7 +275,7 @@ export default function App() {
           kinds.includes('sessions') &&
           sel &&
           sel.projectKey === target.projectKey &&
-          (target.kind === 'project' || target.id === sel.id)
+          (target.kind === 'project' || (target.kind === 'session' && target.id === sel.id))
         if (removed) {
           selectedRef.current = null
           setSelected(null)
@@ -367,6 +367,22 @@ export default function App() {
             <button lang="en" aria-label={t.english} aria-pressed={language === 'en'} onClick={() => setLanguage('en')}>{LANGUAGE_LABELS.en}</button>
             <button lang="zh-CN" aria-label={t.chinese} aria-pressed={language === 'zh'} onClick={() => setLanguage('zh')}>{LANGUAGE_LABELS.zh}</button>
           </div>
+          <button
+            className="icon-btn residue-btn"
+            title={t.checkResidue}
+            aria-label={t.checkResidue}
+            onClick={() => {
+              const source = ui?.source ?? 'claude'
+              const RESIDUE = {
+                claude: { projectKey: 'residue', name: t.claudeResidue, detail: t.claudeResidueHint },
+                codex: { projectKey: 'codex:residue', name: t.codexResidue, detail: t.codexResidueHint },
+                grok: { projectKey: 'grok:residue', name: t.grokResidue, detail: t.grokResidueHint },
+              }[source]
+              setDeleting({ target: { kind: 'residue', projectKey: RESIDUE.projectKey }, name: RESIDUE.name, detail: RESIDUE.detail })
+            }}
+          >
+            <Broom width={15} height={15} />
+          </button>
           <button
             className="icon-btn rightbar-toggle"
             aria-pressed={rightOpen}

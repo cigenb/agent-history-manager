@@ -144,11 +144,13 @@ export interface UiState {
 }
 
 /** What a deletable path is; the delete dialog lets the user pick which kinds to remove. */
-export type DeleteKind = 'sessions' | 'artifacts' | 'history' | 'temp' | 'memory' | 'output'
+export type DeleteKind = 'sessions' | 'artifacts' | 'history' | 'temp' | 'memory' | 'output' | 'cache'
 
 export type DeleteTarget =
   | { kind: 'session'; projectKey: string; id: string }
   | { kind: 'project'; projectKey: string }
+  /** Leftovers outside the list; `projectKey` is `residue` for Claude Code, `codex:residue` or `grok:residue` */
+  | { kind: 'residue'; projectKey: string }
 
 export interface DeleteItem {
   path: string
@@ -166,6 +168,8 @@ export interface DeletePlan {
    * codex: Codex deletes the threads permanently and Desktop's entries for them are removed; files go to the Recycle Bin.
    */
   mode?: 'grok' | 'codex'
+  /** Kinds the dialog leaves unchecked at first, e.g. project memories found during a leftover check */
+  unchecked?: DeleteKind[]
 }
 
 /** One memory file from a project's `memory/` folder. */
@@ -327,6 +331,8 @@ export interface Api {
   planDelete(target: DeleteTarget): Promise<DeletePlan>
   /** Moves the planned files of the chosen kinds to the Recycle Bin */
   runDelete(target: DeleteTarget, kinds: DeleteKind[]): Promise<ActionResult>
+  /** Paths handled so far by the running deletion's Recycle Bin moves */
+  onDeleteProgress(cb: (done: number, total: number) => void): () => void
   /**
    * Conversation titles, prompts and Claude's answer text. Every space-separated term must appear in the title or
    * in one message. `temp` selects temp-folder and scripted conversations, as the sidebar's toggle does.

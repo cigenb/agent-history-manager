@@ -39,27 +39,33 @@ export default function DeleteDialog({
   onConfirm: (target: DeleteTarget, kinds: DeleteKind[]) => Promise<void>
 }) {
   const t = useT()
+  const [plan, setPlan] = useState<DeletePlan | null>(null)
+  // Codex and Grok store different things under the same kinds.
+  const source = request.target.projectKey.startsWith('codex:') ? 'codex' : request.target.projectKey.startsWith('grok:') ? 'grok' : 'claude'
   const KINDS: { kind: DeleteKind; label: string }[] = [
-    { kind: 'sessions', label: t.kindSessions },
-    { kind: 'artifacts', label: t.kindArtifacts },
+    { kind: 'sessions', label: source === 'codex' ? t.kindCodexThreads : t.kindSessions },
+    { kind: 'artifacts', label: source === 'codex' ? t.kindCodexImages : source === 'grok' ? t.kindGrokSubagents : t.kindArtifacts },
     { kind: 'history', label: t.kindHistory },
     { kind: 'temp', label: t.kindTemp },
     { kind: 'memory', label: t.kindMemory },
     { kind: 'output', label: t.kindOutput },
+    { kind: 'cache', label: t.kindCodexCache },
   ]
-  const [plan, setPlan] = useState<DeletePlan | null>(null)
   const [chosen, setChosen] = useState<Set<DeleteKind>>(new Set())
   /** Kind whose exact paths are shown as a third column */
   const [opened, setOpened] = useState<DeleteKind | null>(null)
   const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
+  useEffect(() => window.api.onDeleteProgress((done, total) => setProgress({ done, total })), [])
   const [error, setError] = useState<string | null>(null)
   const isProject = request.target.kind === 'project'
+  const isResidue = request.target.kind === 'residue'
 
   useEffect(() => {
     void window.api.planDelete(request.target)
       .then((p) => {
         setPlan(p)
-        setChosen(new Set(p.items.map((i) => i.kind))) // everything selected by default
+        setChosen(new Set(p.items.map((i) => i.kind).filter((k) => !p.unchecked?.includes(k)))) // selected by default unless the plan says otherwise
       })
       .catch((e: Error) => setError(e.message))
   }, [request])
@@ -87,10 +93,11 @@ export default function DeleteDialog({
   return (
     <div className="modal-backdrop" onMouseDown={() => !busy && onCancel()}>
       <div className="mem-del" onMouseDown={(e) => e.stopPropagation()}>
-        <h2>{isProject ? t.deleteProject : t.deleteSession}</h2>
+        <h2>{isResidue ? request.name : isProject ? t.deleteProject : t.deleteSession}</h2>
         {!plan && !error && <p className="modal-hint">{t.countingFiles}</p>}
         {error && <p className="modal-error">{error}</p>}
-        {plan && (
+        {plan && isResidue && !plan.items.length && <p className="modal-hint">{t.noResidue}</p>}
+        {plan && !!plan.items.length && (
           <>
             <GraphCanvas
               target={
@@ -190,7 +197,7 @@ export default function DeleteDialog({
               await onConfirm(request.target, [...chosen])
             }}
           >
-            {busy ? t.deleting : plan?.mode ? t.deletePermanently : t.moveToRecycleBin}
+            {busy ? (progress?.total ? t.deletingProgress(progress.done, progress.total) : t.deleting) : plan?.mode ? t.deletePermanently : t.moveToRecycleBin}
           </button>
         </div>
       </div>

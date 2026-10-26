@@ -113,3 +113,13 @@ test('exports Grok answers under a Grok heading', () => {
   const md = exportMarkdown(detail, 'T', new Date('2026-01-03T00:00:00Z'))
   assert.ok(md.includes('source: Grok') && md.includes('### **Grok**\n\nA'))
 })
+
+test('reports unlisted sessions and subagent sessions whose parent is gone', async () => {
+  const { scanGrokResidue } = await import('../src/main/grok.ts')
+  await session('orphan-child', { session_kind: 'subagent' }, [user('Old task', 0), agent('done')])
+  await session('blank-session', {}, [])
+  const [project] = await new GrokIndex(join(home, 'cache2.json')).scan()
+  const residue = await scanGrokResidue(new Set(project.sessions.map((s) => s.id)))
+  // empty-session has an answer without a prompt: a conversation, not a leftover.
+  assert.deepEqual(residue.map((r) => [r.id, r.kind]).sort(), [['blank-session', 'sessions'], ['orphan-child', 'artifacts']])
+})

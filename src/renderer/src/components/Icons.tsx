@@ -102,3 +102,11 @@ export const Download = (p: P) => (
     <path d="M12 3v12m-5-5 5 5 5-5M4 15v5h16v-5" />
   </svg>
 )
+
+export const Broom = (p: P) => (
+  <svg {...base(p)}>
+    <path d="m19 3-7.5 7.5" />
+    <path d="M10 9.5 14.5 14l-1.8 6.2a1 1 0 0 1-1.6.5L4 14.3a1 1 0 0 1 .3-1.7Z" />
+    <path d="m7.5 17.5 2-2" />
+  </svg>
+)

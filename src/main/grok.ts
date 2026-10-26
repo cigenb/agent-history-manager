@@ -481,3 +481,58 @@ export async function grokSearchText(file: string): Promise<string[]> {
   }
   return out
 }
+
+async function hasAgentText(sessionDir: string): Promise<boolean> {
+  try {
+    return (await fs.readFile(join(sessionDir, 'updates.jsonl'))).includes('"sessionUpdate":"agent_message_chunk"')
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Session folders the list does not show: top-level sessions it skipped (no prompt, unreadable summary) and
+ * subagent sessions whose parent no longer names them in its `subagents/` folder.
+ */
+export async function scanGrokResidue(listed: Set<string>): Promise<{ id: string; path: string; kind: 'sessions' | 'artifacts' }[]> {
+  const folders: { id: string; path: string }[] = []
+  let dirs: string[] = []
+  try {
+    dirs = (await fs.readdir(GROK_SESSIONS_DIR, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name)
+  } catch {
+    return []
+  }
+  for (const dir of dirs) {
+    try {
+      for (const e of await fs.readdir(join(GROK_SESSIONS_DIR, dir), { withFileTypes: true })) {
+        if (e.isDirectory() && SAFE_SEGMENT.test(e.name)) folders.push({ id: e.name, path: join(GROK_SESSIONS_DIR, dir, e.name) })
+      }
+    } catch {
+      /* unreadable folder */
+    }
+  }
+  const named = new Set<string>()
+  for (const f of folders) {
+    try {
+      for (const child of await fs.readdir(join(f.path, 'subagents'))) named.add(child)
+    } catch {
+      /* no subagents */
+    }
+  }
+  const out: { id: string; path: string; kind: 'sessions' | 'artifacts' }[] = []
+  for (const f of folders) {
+    let kind: string | null | undefined
+    try {
+      kind = (JSON.parse(await fs.readFile(join(f.path, 'summary.json'), 'utf8')) as GrokSummaryFile).session_kind
+    } catch {
+      kind = undefined
+    }
+    if (CHILD_KINDS.has(kind ?? '')) {
+      if (!named.has(f.id)) out.push({ ...f, kind: 'artifacts' })
+    } else if (!listed.has(f.id) && !(await hasAgentText(f.path))) {
+      // Unlisted for lack of a prompt; one Grok answered anyway is a conversation, not a leftover.
+      out.push({ ...f, kind: 'sessions' })
+    }
+  }
+  return out
+}

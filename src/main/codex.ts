@@ -1,6 +1,6 @@
 import { existsSync, promises as fs, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, extname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { AgentDetail, AgentRun, ImageData, McpUse, ProjectSummary, SessionDetail, SessionSummary, SessionVersion, Turn } from '../shared/types'
 import { projectKeyOf, TEMP_PATTERNS } from './sessions'
@@ -524,7 +524,7 @@ export function codexSearchText(threadId: string): string[] {
 
 /**
  * Removes every trace of the given thread ids from Codex Desktop's state: object keys and list items that
- * mention one. Desktop keeps per-thread entries (descriptions, workspace hints, output folders, sidebar order)
+ * mention one. Desktop's own markers for threads it deleted stay. Desktop keeps per-thread entries (descriptions, workspace hints, output folders, sidebar order)
  * and does not prune them for threads deleted elsewhere.
  */
 export function forgetThreads(value: unknown, ids: string[]): { value: unknown; removed: number } {
@@ -546,7 +546,7 @@ export function forgetThreads(value: unknown, ids: string[]): { value: unknown; 
     if (v && typeof v === 'object') {
       const out: Record<string, unknown> = {}
       for (const [k, x] of Object.entries(v)) {
-        if (mentions(k)) {
+        if (mentions(k) && !k.startsWith(DELETED_MARKER)) {
           removed++
           continue
         }
@@ -557,4 +557,157 @@ export function forgetThreads(value: unknown, ids: string[]): { value: unknown; 
     return v
   }
   return { value: walk(value), removed }
+}
+
+/**
+ * Codex Desktop gives each projectless chat its own working folder, `<root>\<date>\<slug>` (default root
+ * `Documents\Codex`), with the outputs inside. The roots come from the output folders Desktop records for its projectless chats. `used` tells whether any indexed thread works in or below a folder.
+ */
+export async function projectlessWorkspaces(state: GlobalState): Promise<{ all: string[]; used: (dir: string) => boolean; contains: (path: string) => string | null }> {
+  const db = openDb()
+  let cwds: string[] = []
+  try {
+    cwds = db ? (db.prepare('SELECT cwd FROM threads').all() as { cwd: string }[]).map((r) => plainPath(r.cwd ?? '')) : []
+  } finally {
+    db?.close()
+  }
+  const roots = new Set<string>()
+  for (const out of Object.values(state['thread-projectless-output-directories'] ?? {})) roots.add(dirname(dirname(dirname(plainPath(out)))))
+  const all: string[] = []
+  for (const r of roots) {
+    for (const day of await dirNamesOf(r)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
+      for (const slug of await dirNamesOf(join(r, day))) all.push(join(r, day, slug))
+    }
+  }
+  const used = (dir: string) => cwds.some((c) => within(c, dir))
+  const contains = (path: string) => all.find((dir) => within(path, dir) && projectKeyOf(plainPath(path)) === projectKeyOf(dir)) ?? null
+  return { all, used, contains }
+}
+
+async function dirNamesOf(path: string): Promise<string[]> {
+  try {
+    return (await fs.readdir(path, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name)
+  } catch {
+    return []
+  }
+}
+
+/** Desktop's key for a thread it deleted itself; its purpose is undocumented, so it is never removed. */
+const DELETED_MARKER = 'codex-writing-block-deleted-thread-v1:'
+
+const THREAD_ID = /[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/g
+/**
+ * `rollout-<time>-<thread>.jsonl[.zst]`. Some files carry a second id (`<thread>_<other>`); they belong to the
+ * first thread, and Codex's history projection has rows for the second id.
+ */
+const ROLLOUT_FILE = /^rollout-.*?-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_([0-9a-f-]{36}))?\.jsonl(\.zst)?$/
+
+/** Leftovers of threads that are no longer in Codex's index, and so not listed. */
+export interface CodexResidue {
+  /** Rollout files without an index row; Codex's thread/delete still finds them by id */
+  rollouts: { id: string; path: string }[]
+  /** Deleted threads still named in Desktop's state file or the name index */
+  stateIds: string[]
+  /** Output folders of deleted projectless threads, and generated images of deleted threads */
+  folders: { path: string; kind: 'output' | 'artifacts' }[]
+}
+
+/** A rollout file, the thread it belongs to, and the second id some file names carry */
+export interface RolloutFile {
+  id: string
+  other?: string
+  path: string
+}
+
+async function walkRollouts(dir: string, out: RolloutFile[]): Promise<void> {
+  let entries
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    const path = join(dir, e.name)
+    if (e.isDirectory()) await walkRollouts(path, out)
+    else {
+      const m = ROLLOUT_FILE.exec(e.name)
+      if (m) out.push({ id: m[1], other: m[2], path })
+    }
+  }
+}
+
+/** Every rollout file with the thread it belongs to. */
+export async function codexRolloutFiles(): Promise<RolloutFile[]> {
+  const files: RolloutFile[] = []
+  await walkRollouts(join(CODEX_HOME, 'sessions'), files)
+  await walkRollouts(join(CODEX_HOME, 'archived_sessions'), files)
+  return files
+}
+
+/**
+ * Finds what deleted threads left behind. A thread id in Desktop's state counts as deleted only with evidence that
+ * it was a local thread: Desktop marked it deleted, or assigned it to a local project or the projectless group.
+ * Ids that Desktop's cloud and automation features (`aeon-`, `cloud-aeon-`, `orbit-` entries) refer to are left
+ * alone: those threads may live outside this machine's index.
+ */
+export async function scanCodexResidue(): Promise<CodexResidue> {
+  const db = openDb()
+  if (!db) return { rollouts: [], stateIds: [], folders: [] }
+  let live: Set<string>
+  try {
+    live = new Set((db.prepare('SELECT id FROM threads').all() as { id: string }[]).map((r) => r.id))
+  } finally {
+    db.close()
+  }
+  const rollouts = (await codexRolloutFiles()).filter((f) => !live.has(f.id))
+
+  const state = (await readGlobalState()) as Record<string, unknown>
+  const atoms = (state['electron-persisted-atom-state'] ?? {}) as Record<string, unknown>
+  const ids = (text: string) => text.match(THREAD_ID) ?? []
+  const keysOf = (v: unknown) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v) : [])
+  const named = new Set<string>()
+  for (const [k, v] of Object.entries(state)) if (k.startsWith('thread-')) for (const id of keysOf(v)) named.add(id)
+  for (const id of (state['projectless-thread-ids'] as string[] | undefined) ?? []) named.add(id)
+  const deleted = new Set<string>()
+  const remote = new Set<string>()
+  for (const [k, v] of Object.entries(atoms)) {
+    if (k.startsWith(DELETED_MARKER)) deleted.add(k.slice(DELETED_MARKER.length))
+    else if (/^(aeon-|cloud-aeon|orbit-)/.test(k)) for (const id of ids(k + JSON.stringify(v))) remote.add(id)
+    else if (k.includes('thread')) for (const id of [...ids(k), ...keysOf(v)]) named.add(id)
+  }
+  for (const id of (await threadNames()).keys()) named.add(id)
+  const local = new Set([
+    ...keysOf(state['thread-project-membership-host-ids']),
+    ...keysOf(state['thread-project-assignments']),
+    ...keysOf(state['thread-projectless-output-directories']),
+    ...((state['projectless-thread-ids'] as string[] | undefined) ?? []),
+  ])
+  const isThreadId = (id: string) => new RegExp(`^${THREAD_ID.source}$`).test(id)
+  const stateIds = [...named].filter((id) => isThreadId(id) && !live.has(id) && !remote.has(id) && (deleted.has(id) || local.has(id)))
+
+  const folders: CodexResidue['folders'] = []
+  const workspaces = await projectlessWorkspaces(state as GlobalState)
+  for (const dir of workspaces.all) if (!workspaces.used(dir)) folders.push({ path: dir, kind: 'output' })
+  try {
+    for (const name of await fs.readdir(join(CODEX_HOME, 'generated_images'))) {
+      if (!live.has(name) && /^[0-9a-f-]{36}$/.test(name)) folders.push({ path: join(CODEX_HOME, 'generated_images', name), kind: 'artifacts' })
+    }
+  } catch {
+    /* no generated images */
+  }
+  return { rollouts, stateIds, folders }
+}
+
+/** Ids of indexed threads, subagents included, that work in or below a folder. */
+export function codexThreadsIn(dir: string): string[] {
+  const db = openDb()
+  if (!db) return []
+  try {
+    return (db.prepare('SELECT id, cwd FROM threads').all() as { id: string; cwd: string }[])
+      .filter((r) => within(plainPath(r.cwd ?? ''), dir))
+      .map((r) => r.id)
+  } finally {
+    db.close()
+  }
 }

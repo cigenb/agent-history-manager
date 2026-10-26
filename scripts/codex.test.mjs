@@ -20,7 +20,7 @@ registerHooks({
 
 const home = await mkdtemp(join(tmpdir(), 'codex-history-'))
 process.env.CODEX_HOME = home
-const { codexDescendants, forgetThreads, loadCodexAgent, loadCodexSession, scanCodex } = await import('../src/main/codex.ts')
+const { codexDescendants, forgetThreads, loadCodexAgent, loadCodexSession, scanCodex, scanCodexResidue } = await import('../src/main/codex.ts')
 
 const db = new DatabaseSync(join(home, 'state_5.sqlite'))
 db.exec(`CREATE TABLE threads (id TEXT, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, source TEXT, cwd TEXT,
@@ -121,4 +121,47 @@ test('forgets every key and list item that mentions a deleted thread', () => {
     'electron-persisted-atom-state': { other: 1 },
     orders: { p: [{ id: 'keep' }] },
   })
+})
+
+test('finds leftovers of threads that are no longer indexed, with evidence, and leaves live ones alone', async () => {
+  const { mkdir } = await import('node:fs/promises')
+  const day = join(home, 'sessions', '2026', '01', '02')
+  await mkdir(day, { recursive: true })
+  const orphan = '01a00000-0000-7000-8000-000000000001'
+  const live = 'assigned'
+  await writeFile(join(day, `rollout-2026-01-02T00-00-00-${orphan}.jsonl.zst`), 'x')
+  await writeFile(join(day, `rollout-2026-01-02T00-00-00-${orphan}_01a00000-0000-7000-8000-0000000000aa.jsonl`), 'x')
+  const deleted = '01a00000-0000-7000-8000-000000000002'
+  const cloud = '01a00000-0000-7000-8000-000000000003'
+  const unknown = '01a00000-0000-7000-8000-000000000004'
+  const ws = join(home, 'ws', '2026-01-02')
+  const out = join(ws, 'old', 'outputs')
+  await mkdir(out, { recursive: true })
+  await mkdir(join(ws, 'busy'), { recursive: true })
+  const rw = new DatabaseSync(join(home, 'state_5.sqlite'))
+  rw.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run('busy-thread', 'r9', 1, 1, 'vscode', '\\\\?\\' + join(ws, 'busy'), 'Busy', null, 0, 'm')
+  rw.close()
+  await mkdir(join(home, 'generated_images', deleted), { recursive: true })
+  await writeFile(
+    join(home, '.codex-global-state.json'),
+    JSON.stringify({
+      ...state,
+      'thread-projectless-output-directories': { ...state['thread-projectless-output-directories'], [deleted]: out, [cloud]: out },
+      'thread-workspace-root-hints': { [deleted]: 'x', [cloud]: 'x', [unknown]: 'x' },
+      'electron-persisted-atom-state': {
+        [`codex-writing-block-deleted-thread-v1:${deleted}`]: true,
+        [`codex-writing-block-deleted-thread-v1:${cloud}`]: true,
+        'aeon-last-activity-v1': { [cloud]: 1 },
+      },
+    }),
+  )
+  const r = await scanCodexResidue()
+  assert.deepEqual(r.rollouts.map((x) => x.id), [orphan, orphan])
+  assert.deepEqual(r.stateIds, [deleted])
+  // Working folders: the deleted chat's is listed, the one an indexed thread still uses is not.
+  assert.deepEqual(r.folders.map((f) => [f.kind, f.path]).sort(), [['artifacts', join(home, 'generated_images', deleted)], ['output', join(ws, 'old')]])
+  assert.ok(!JSON.stringify(r).includes(live))
+  // Desktop's own deleted markers survive the cleanup of their thread.
+  const { value } = forgetThreads({ [`codex-writing-block-deleted-thread-v1:${deleted}`]: true, [deleted]: 1 }, [deleted])
+  assert.deepEqual(value, { [`codex-writing-block-deleted-thread-v1:${deleted}`]: true })
 })

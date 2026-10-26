@@ -40,15 +40,23 @@ Codex conversations are grouped by Codex Desktop project, with the titles Codex 
 
 - **Conversation records**: deleted by Codex itself (`thread/delete` of the Codex app-server bundled with Codex Desktop), including the conversation's subagent threads. This is permanent.
 - **Codex Desktop cache entries**: Codex Desktop keeps per-conversation entries (descriptions, workspace hints, output folders, sidebar order) in `~/.codex/.codex-global-state.json` and does not remove them for every deleted conversation. The app removes the entries of the deleted conversations from that file and from `session_index.jsonl` and `history.jsonl`. Each changed file is backed up first to `codex-backups` in the app's data folder.
-- **Generated images** (`~/.codex/generated_images/<id>`) and the **output folder of a projectless chat**: moved to the Recycle Bin. An output folder is only removed when no other conversation uses it. The working folder of a conversation in a project is never removed.
+- **Generated images** (`~/.codex/generated_images/<id>`) and the **working folder of a projectless chat** (the folder Codex Desktop created for it, outputs included): moved to the Recycle Bin. A working folder is only removed when no other conversation works in it. The working folder of a conversation in a project is never removed.
 
 Quit Codex Desktop completely before deleting: it keeps its state in memory and writes it back, so deletion is refused while it is running.
+
+**Check Codex leftovers** (see [Leftover check](#leftover-check)) lists what conversations no longer in the list left behind, grouped like the delete dialog: rollout files Codex no longer indexes, Codex Desktop cache entries of deleted conversations, working folders of projectless chats that no conversation uses any more, and generated images of deleted conversations. Expand a category to see each path and open it in File Explorer; uncheck what you want to keep. Only entries with evidence of a deleted local conversation are cleaned. Log rows of conversations that have no rollout file are not touched.
 
 ## Grok conversations
 
 Grok's own subagents are listed in the right panel and can be opened.
 
+**Check Grok leftovers** (see [Leftover check](#leftover-check)) lists session folders the list doesn't show: empty sessions without a prompt or a reply, unreadable sessions, and subagent sessions whose parent was deleted. They go to the Recycle Bin.
+
 Deleting a Grok conversation is permanent: it runs `grok sessions delete` for the session and the sessions of its subagents, which may also remove history stored remotely. Subagent session folders the Grok CLI leaves behind go to the Recycle Bin. Sessions open in Grok cannot be deleted or resumed.
+
+## Leftover check
+
+The broom button in the title bar checks the selected history for files the list doesn't account for, and shows them in the same dialog as deletion: grouped by category, each path openable in File Explorer, each category optional. For Claude Code these are sessions without a prompt or a reply, subagent output, `/rewind` backups, session environments and temporary workspaces of sessions that no longer exist, and project folders without sessions; memories found there start unchecked. Everything goes to the Recycle Bin. Codex and Grok are described above.
 
 ## Manage Claude Code project memories
 

@@ -1106,6 +1106,8 @@ body.resizing .resizer {
   flex: none;
   border-left: 1px solid var(--border);
 }
+/* The title bar is a window drag region; its buttons must opt out to receive clicks. */
+.residue-btn,
 .rightbar-toggle {
   flex: none;
   -webkit-app-region: no-drag;

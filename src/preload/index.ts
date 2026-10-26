@@ -41,6 +41,11 @@ const api: Api = {
     ipcRenderer.on('session:agentsChanged', h)
     return () => ipcRenderer.removeListener('session:agentsChanged', h)
   },
+  onDeleteProgress: (cb) => {
+    const h = (_e: unknown, done: number, total: number): void => cb(done, total)
+    ipcRenderer.on('delete:progress', h)
+    return () => ipcRenderer.removeListener('delete:progress', h)
+  },
   getLiveSessions: () => ipcRenderer.invoke('live:get'),
   onLiveSessionsChanged: (cb) => {
     const h = (_e: unknown, live: LiveSessions): void => cb(live)

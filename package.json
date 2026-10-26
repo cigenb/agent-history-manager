@@ -1,7 +1,7 @@
 {
   "name": "agent-history-manager",
   "productName": "Agent History Manager",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Browse and manage Claude Code, Codex and Grok conversations by project",
   "author": "cigenb",
   "license": "MIT",
