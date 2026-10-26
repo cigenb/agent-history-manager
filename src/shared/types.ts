@@ -21,7 +21,7 @@ export interface SessionSummary extends SessionVersion {
   projectKey: string
   /** Latest activity across all versions; used for ordering */
   familyActivity: number
-  /** Started by `claude -p` / `grok -p` (scripts, hooks, tests) rather than by a person */
+  /** Scripted sessions, or Claude/Grok records with visible content but no human prompt; shown in the secondary view */
   headless: boolean
   versions: SessionVersion[]
   /** Codex threads archived in Codex Desktop */
@@ -251,6 +251,7 @@ export type ActionError =
   | { code: 'session-open' | 'session-missing' | 'project-missing' | 'name-empty' | 'memory-missing' | 'backup-missing' | 'export-failed' }
   | { code: 'trash-failed' | 'memory-update-failed' | 'backup-changed'; files: string[] }
   | { code: 'directory-missing'; path: string }
+  | { code: 'memory-linked-path'; path: string }
   | { code: 'terminal-failed' | 'rename-failed' | 'backup-failed' | 'grok-failed'; detail: string }
   | { code: 'grok-session-open' | 'codex-running' }
   | { code: 'codex-failed'; detail: string }

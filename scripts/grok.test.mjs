@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { registerHooks } from 'node:module'
 import { join } from 'node:path'
@@ -65,7 +65,8 @@ await writeFile(
 )
 await session(child, { session_kind: 'subagent' }, [user('Read marker.txt', 0), agent('MARKER')])
 await session('headless-session', { session_kind: 'headless', generated_title: 'Script' }, [user('Run tests', 0), agent('ok')])
-await session('empty-session', {}, [agent('no prompt')])
+await session('answer-only-session', {}, [agent('no prompt')])
+await session('blank-session', {}, [])
 
 test.after(() => rm(home, { recursive: true, force: true }))
 
@@ -89,13 +90,17 @@ test('lists top-level sessions by working directory and hides child and empty se
   assert.equal(project.source, 'grok')
   assert.equal(project.key, 'grok:c:\\example\\project')
   const byId = Object.fromEntries(project.sessions.map((s) => [s.id, s]))
-  assert.deepEqual(Object.keys(byId).sort(), ['headless-session', parent])
+  assert.deepEqual(Object.keys(byId).sort(), ['answer-only-session', 'headless-session', parent])
   assert.equal(byId[parent].title, 'Build check')
   assert.equal(byId[parent].promptCount, 2)
   assert.equal(byId['headless-session'].headless, true)
+  assert.equal(byId['answer-only-session'].headless, true)
+  assert.equal(byId['answer-only-session'].title, 'no prompt')
+  assert.equal(byId['answer-only-session'].promptCount, 0)
   // Unchanged files come from the cache on the next scan.
   const again = await new GrokIndex(join(home, 'cache.json')).scan()
   assert.equal(again[0].sessions.find((s) => s.id === parent).promptCount, 2)
+  assert.equal(again[0].sessions.find((s) => s.id === 'answer-only-session').title, 'no prompt')
 })
 
 test('loads a subagent session and indexes the shown text for search', async () => {
@@ -120,6 +125,35 @@ test('reports unlisted sessions and subagent sessions whose parent is gone', asy
   await session('blank-session', {}, [])
   const [project] = await new GrokIndex(join(home, 'cache2.json')).scan()
   const residue = await scanGrokResidue(new Set(project.sessions.map((s) => s.id)))
-  // empty-session has an answer without a prompt: a conversation, not a leftover.
+  // An answer without a prompt is a conversation, not a leftover.
   assert.deepEqual(residue.map((r) => [r.id, r.kind]).sort(), [['blank-session', 'sessions'], ['orphan-child', 'artifacts']])
+})
+
+test('rebuilds old Grok caches so answer-only sessions become accessible', async () => {
+  const dir = await session('cached-answer', {}, [agent('Cached report')])
+  const file = join(dir, 'updates.jsonl')
+  const st = await stat(file)
+  const cache = join(home, 'old-cache.json')
+  await writeFile(cache, JSON.stringify({ version: 1, files: {
+    [file]: { size: st.size, mtimeMs: st.mtimeMs, offset: st.size, promptCount: 0 },
+  } }))
+  const first = (await new GrokIndex(cache).scan()).flatMap((p) => p.sessions).find((s) => s.id === 'cached-answer')
+  assert.ok(first)
+  assert.equal(first.title, 'Cached report')
+  assert.equal(first.headless, true)
+  const again = (await new GrokIndex(cache).scan()).flatMap((p) => p.sessions).find((s) => s.id === 'cached-answer')
+  assert.equal(again.title, 'Cached report')
+})
+
+test('Grok answer-only sessions return to the normal view after a prompt is appended', async () => {
+  const dir = await session('later-prompt', {}, [agent('Background report')])
+  const cache = join(home, 'incremental-cache.json')
+  const index = new GrokIndex(cache)
+  const find = (projects) => projects.flatMap((p) => p.sessions).find((s) => s.id === 'later-prompt')
+  assert.equal(find(await index.scan())?.headless, true)
+  await appendFile(join(dir, 'updates.jsonl'), user('Continue normally', 0) + '\n')
+  const updated = find(await index.scan())
+  assert.equal(updated.promptCount, 1)
+  assert.equal(updated.headless, false)
+  assert.equal(updated.title, 'Continue normally')
 })

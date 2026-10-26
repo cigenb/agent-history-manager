@@ -30,7 +30,7 @@ import {
   type CodexThread,
 } from './codex'
 import { GROK_HOME, grokDescendants, grokExecutable, grokSessionDir, isGrokKey, scanGrokResidue } from './grok'
-import { findSession, projectMemoryDir, PROJECTS_DIR } from './sessions'
+import { classifyUser, findSession, projectMemoryDir, PROJECTS_DIR, readLines, type RawRecord } from './sessions'
 
 const CLAUDE_DIR = join(homedir(), '.claude')
 
@@ -51,12 +51,13 @@ export const LIVE_SESSIONS_DIR = join(CLAUDE_DIR, 'sessions')
  * writes ~/.claude/sessions/<pid>.json; files left behind by crashed processes are ignored via the pid check.
  * Any status other than "busy" counts as idle.
  */
-export async function liveSessions(): Promise<LiveSessions> {
+export async function liveSessions(strict = false): Promise<LiveSessions> {
   const live: LiveSessions = {}
   let names: string[] = []
   try {
     names = await fs.readdir(LIVE_SESSIONS_DIR)
-  } catch {
+  } catch (e) {
+    if (strict && (e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     return live
   }
   for (const name of names) {
@@ -68,15 +69,15 @@ export async function liveSessions(): Promise<LiveSessions> {
         status?: string
       }
       if (s.sessionId && s.pid && pidAlive(s.pid)) live[s.sessionId] = s.status === 'busy' ? 'busy' : 'idle'
-    } catch {
-      /* being written or malformed */
+    } catch (e) {
+      if (strict && pidAlive(Number(name.slice(0, -5)))) throw e
     }
   }
   return live
 }
 
 export async function liveSessionIds(): Promise<Set<string>> {
-  return new Set(Object.keys(await liveSessions()))
+  return new Set(Object.keys(await liveSessions(true)))
 }
 
 const OPEN_ERROR: ActionError = { code: 'session-open' }
@@ -139,7 +140,10 @@ function versionPaths(v: SessionVersion): { path: string; kind: DeleteKind }[] {
 
 async function existing(paths: { path: string; kind: DeleteKind }[]): Promise<DeleteItem[]> {
   const out: DeleteItem[] = []
+  const seen = new Set<string>()
   for (const { path, kind } of paths) {
+    if (seen.has(path.toLowerCase())) continue
+    seen.add(path.toLowerCase())
     const bytes = await sizeOf(path)
     if (bytes !== null) out.push({ path, bytes, kind })
   }
@@ -152,20 +156,22 @@ function targetVersions(projects: ProjectSummary[], target: DeleteTarget): Sessi
 }
 
 export async function planDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<DeletePlan> {
-  if (isGrokKey(target.projectKey)) return planGrokDelete(projects, target)
   if (target.kind === 'residue') {
     if (isGrokKey(target.projectKey)) return (await planGrokResidue(projects)).plan
     return isCodexKey(target.projectKey) ? (await planCodexResidue()).plan : (await planClaudeResidue(projects)).plan
   }
+  if (isGrokKey(target.projectKey)) return planGrokDelete(projects, target)
   if (isCodexKey(target.projectKey)) return (await planCodexDelete(projects, target)).plan
   const versions = targetVersions(projects, target)
-  const live = await liveSessionIds()
   const project = projects.find((p) => p.key === target.projectKey)
   // Only the folder Claude Code derives from this project's own path. Copies of a conversation can live in
   // another project's folder, and that folder's memory belongs to the other project.
   const memoryDir: { path: string; kind: DeleteKind }[] =
-    target.kind === 'project' && project ? [{ path: projectMemoryDir(project.path), kind: 'memory' }] : []
+    target.kind === 'project' && project && !projects.some((p) =>
+      p.source === 'claude' && p.key !== project.key && projectMemoryDir(p.path).toLowerCase() === projectMemoryDir(project.path).toLowerCase(),
+    ) ? [{ path: projectMemoryDir(project.path), kind: 'memory' }] : []
   const items = await existing([...versions.flatMap(versionPaths), ...memoryDir])
+  const live = await liveSessionIds()
   const blocked = versions.some((v) => live.has(v.id)) ? OPEN_ERROR : undefined
   return { items, blocked }
 }
@@ -176,11 +182,11 @@ export async function runDelete(
   target: DeleteTarget,
   kinds: DeleteKind[],
 ): Promise<ActionResult> {
-  if (isGrokKey(target.projectKey)) return runGrokDelete(projects, target)
   if (target.kind === 'residue') {
     if (isGrokKey(target.projectKey)) return runGrokResidue(projects, kinds)
     return isCodexKey(target.projectKey) ? runCodexResidue(kinds) : runClaudeResidue(projects, kinds)
   }
+  if (isGrokKey(target.projectKey)) return runGrokDelete(projects, target)
   if (isCodexKey(target.projectKey)) return runCodexDelete(projects, target, kinds)
   const plan = await planDelete(projects, target)
   if (plan.blocked) return { ok: false, error: plan.blocked }
@@ -316,6 +322,7 @@ async function grokSessionBusy(id: string): Promise<boolean> {
     // No file: no session is open. A file Grok is rewriting can't be read: assume the session may be open.
     return (e as NodeJS.ErrnoException).code !== 'ENOENT'
   }
+  if (!data || typeof data !== 'object') return true
   const rows: [string, unknown][] = Array.isArray(data)
     ? data.map((v) => ['', v])
     : data && typeof data === 'object'
@@ -357,7 +364,7 @@ async function planGrokDelete(projects: ProjectSummary[], target: DeleteTarget):
     items.push({ path: s.dir, bytes: (await sizeOf(s.dir)) ?? 0, kind: 'sessions' })
     for (const c of s.children) items.push({ path: c.dir, bytes: (await sizeOf(c.dir)) ?? 0, kind: 'artifacts' })
   }
-  for (const s of sessions) {
+  for (const s of sessions.flatMap((s) => [s, ...s.children])) {
     if (await grokSessionBusy(s.id)) return { items, blocked: { code: 'grok-session-open' }, mode: 'grok' }
   }
   return { items, mode: 'grok' }
@@ -365,22 +372,28 @@ async function planGrokDelete(projects: ProjectSummary[], target: DeleteTarget):
 
 async function runGrokDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<ActionResult> {
   const sessions = await grokTargets(projects, target)
-  for (const s of sessions) {
+  for (const s of sessions.flatMap((s) => [s, ...s.children])) {
     if (await grokSessionBusy(s.id)) return { ok: false, error: { code: 'grok-session-open' } }
   }
   const failures: string[] = []
   for (const session of sessions) {
+    if (await grokSessionBusy(session.id)) return { ok: false, error: { code: 'grok-session-open' } }
     const r = await run(grokExecutable(), ['sessions', 'delete', session.id])
-    if (existsSync(session.dir)) {
+    if (r.code !== 0 || existsSync(session.dir)) {
       // The parent is still there: keep its subagents' sessions with it.
       failures.push(lastLine(r.stderr || r.stdout) || session.dir)
       continue
     }
     for (const c of session.children) {
+      if (await grokSessionBusy(c.id)) return { ok: false, error: { code: 'grok-session-open' } }
       await run(grokExecutable(), ['sessions', 'delete', c.id])
       // The CLI skips the local folders of hidden subagent sessions; those go to the Recycle Bin instead.
-      if (existsSync(c.dir)) await shell.trashItem(c.dir).catch(() => failures.push(c.dir))
+      if (existsSync(c.dir)) {
+        if (await grokSessionBusy(c.id)) return { ok: false, error: { code: 'grok-session-open' } }
+        await shell.trashItem(c.dir).catch(() => failures.push(c.dir))
+      }
     }
+    for (const dir of new Set([session.dir, ...session.children.map((c) => c.dir)].map(dirname))) await fs.rmdir(dir).catch(() => undefined)
   }
   return failures.length ? { ok: false, error: { code: 'grok-failed', detail: failures.join('\n') } } : { ok: true }
 }
@@ -400,7 +413,7 @@ function codexDesktopRunning(): Promise<boolean> {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `Get-CimInstance Win32_Process -Filter "Name='Codex.exe'" | ForEach-Object { "$($_.ExecutablePath) $($_.CommandLine)" }`,
+        `$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter "Name='Codex.exe'" -ErrorAction Stop | ForEach-Object { if (!$_.ExecutablePath) { throw 'ExecutablePath unavailable' }; $_.ExecutablePath }`,
       ],
       { windowsHide: true, timeout: 30_000 },
       (error, stdout) => resolve(!!error || /\\WindowsApps\\OpenAI\.Codex_/i.test(String(stdout))),
@@ -456,6 +469,7 @@ function codexDeleteThreads(ids: string[]): Promise<string[]> {
       }
     })
     child.on('error', (e) => fail(e.message))
+    child.stdin.on('error', (e) => fail(e.message))
     child.on('exit', () => fail('Codex app-server exited'))
     let seq = 0
     const call = (method: string, params: unknown) =>
@@ -526,7 +540,15 @@ async function forgetCodexThreads(ids: string[]): Promise<string[]> {
     try {
       if (!existsSync(file)) continue
       const lines = (await fs.readFile(file, 'utf8')).split('\n')
-      const kept = lines.filter((l) => !ids.some((id) => l.includes(id)))
+      const deleting = new Set(ids)
+      const kept = lines.filter((l) => {
+        try {
+          const row = JSON.parse(l) as { id?: string; session_id?: string }
+          return !deleting.has(name === 'session_index.jsonl' ? row.id ?? '' : row.session_id ?? '')
+        } catch {
+          return true
+        }
+      })
       if (kept.length !== lines.length) await replace(file, kept.join('\n'))
     } catch {
       failures.push(file)
@@ -543,7 +565,7 @@ async function planCodexDelete(
   const top = targetVersions(projects, target).map((v) => v.id)
   const threads = [...top.map(codexThread).filter((t): t is CodexThread => !!t), ...codexDescendants(top)]
   const all = threads.map((t) => t.id)
-  const state = await readGlobalState()
+  const state = await readGlobalState(true)
   const items: DeleteItem[] = []
   // Listed even when the rollout file is gone: the thread's index rows still need thread/delete.
   for (const t of threads) items.push({ path: t.rolloutPath || t.id, bytes: (t.rolloutPath && (await sizeOf(t.rolloutPath))) || 0, kind: 'sessions' })
@@ -551,9 +573,9 @@ async function planCodexDelete(
   // moved to the Recycle Bin afterwards.
   const own = new Set(threads.map((t) => t.rolloutPath.toLowerCase()))
   const ids = new Set(all)
-  // Never one whose second id is a thread of its own.
+  // Keep copies that refer to another thread unless that thread is also being deleted.
   const extra = (await codexRolloutFiles())
-    .filter((f) => ids.has(f.id) && !own.has(f.path.toLowerCase()) && !(f.other && codexThread(f.other)))
+    .filter((f) => ids.has(f.id) && !own.has(f.path.toLowerCase()) && !(f.other && !ids.has(f.other) && codexThread(f.other)))
     .map((f) => f.path)
   for (const path of extra) items.push({ path, bytes: (await sizeOf(path)) ?? 0, kind: 'sessions' })
   if (forgetThreads(state, all).removed) items.push({ path: CODEX_GLOBAL_STATE, bytes: 0, kind: 'sessions' })
@@ -569,8 +591,9 @@ async function planCodexDelete(
   for (const t of threads) {
     const dir = workspaces.contains(t.cwd)
     if (!dir || files.some((f) => f.path.toLowerCase() === dir.toLowerCase())) continue
-    const others = codexThreadsIn(dir).filter((id) => !deleting.has(id))
-    const bytes = others.length ? null : await sizeOf(dir)
+    const occupants = codexThreadsIn(dir)
+    if (occupants === null || occupants.some((id) => !deleting.has(id))) continue
+    const bytes = await sizeOf(dir)
     if (bytes !== null) files.push({ path: dir, bytes, kind: 'output' })
   }
   items.push(...files)
@@ -586,6 +609,7 @@ async function runCodexDelete(projects: ProjectSummary[], target: DeleteTarget, 
     failures.push(...(await codexDeleteThreads(top)))
     // Desktop's entries and the threads' files go only once Codex has deleted the threads themselves.
     if (failures.length) return { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } }
+    if (await codexDesktopRunning()) return { ok: false, error: { code: 'codex-running' } }
     failures.push(...(await forgetCodexThreads(all)))
     for (const path of extra.filter((x) => existsSync(x))) await shell.trashItem(path).catch(() => failures.push(path))
   }
@@ -606,7 +630,9 @@ async function planCodexResidue() {
     for (const x of xs) if (!(await recentlyUsed(x.path))) out.push(x)
     return out
   }
-  residue.rollouts = await fresh(residue.rollouts)
+  const recentIds = new Set<string>()
+  for (const r of residue.rollouts) if (await recentlyUsed(r.path)) recentIds.add(r.id)
+  residue.rollouts = residue.rollouts.filter((r) => !recentIds.has(r.id))
   residue.folders = await fresh(residue.folders)
   const items: DeleteItem[] = []
   for (const r of residue.rollouts) items.push({ path: r.path, bytes: (await sizeOf(r.path)) ?? 0, kind: 'sessions' })
@@ -622,10 +648,13 @@ async function runCodexResidue(kinds: DeleteKind[]): Promise<ActionResult> {
   const failures: string[] = []
   const forget = kinds.includes('cache') ? [...residue.stateIds] : []
   if (kinds.includes('sessions') && residue.rollouts.length) {
-    const failed = await codexDeleteThreads(residue.rollouts.map((r) => r.id))
+    const failed = await codexDeleteThreads([...new Set(residue.rollouts.map((r) => r.id))])
     failures.push(...failed)
+    if (failures.length) return { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } }
+    if (await codexDesktopRunning()) return { ok: false, error: { code: 'codex-running' } }
+    failures.push(...(await trashPaths(residue.rollouts.map((r) => r.path).filter((p) => existsSync(p)))))
     // A deleted rollout's thread may still be named in Desktop's state.
-    if (kinds.includes('cache')) forget.push(...residue.rollouts.map((r) => r.id).filter((id) => !failed.some((f) => f.startsWith(id))))
+    if (kinds.includes('cache')) forget.push(...residue.rollouts.map((r) => r.id))
   }
   if (forget.length) failures.push(...(await forgetCodexThreads(forget)))
   failures.push(...(await trashFolders(residue.folders.filter((x) => kinds.includes(x.kind)))))
@@ -638,8 +667,24 @@ async function runCodexResidue(kinds: DeleteKind[]): Promise<ActionResult> {
  */
 async function planGrokResidue(projects: ProjectSummary[]) {
   const listed = new Set(projects.filter((p) => p.source === 'grok').flatMap((p) => p.sessions.map((s) => s.id)))
-  const folders = []
-  for (const f of await scanGrokResidue(listed)) if (!(await grokSessionBusy(f.id)) && !(await recentlyUsed(f.path))) folders.push(f)
+  const folders: { id: string; path: string; kind: 'sessions' | 'artifacts' }[] = []
+  const seen = new Set<string>()
+  for (const f of await scanGrokResidue(listed)) {
+    const related = [f, ...(await grokDescendants(f.path)).map((c) => ({ id: c.id, path: c.dir, kind: 'artifacts' as const }))]
+    let protectedSession = false
+    for (const c of related) {
+      if (await grokSessionBusy(c.id) || await recentlyUsed(c.path)) {
+        protectedSession = true
+        break
+      }
+    }
+    if (protectedSession) continue
+    for (const c of related) {
+      if (seen.has(c.path.toLowerCase())) continue
+      seen.add(c.path.toLowerCase())
+      folders.push(c)
+    }
+  }
   const items: DeleteItem[] = []
   for (const f of folders) items.push({ path: f.path, bytes: (await sizeOf(f.path)) ?? 0, kind: f.kind })
   return { plan: { items } as DeletePlan, folders }
@@ -647,6 +692,7 @@ async function planGrokResidue(projects: ProjectSummary[]) {
 
 async function runGrokResidue(projects: ProjectSummary[], kinds: DeleteKind[]): Promise<ActionResult> {
   const { folders } = await planGrokResidue(projects)
+  for (const f of folders) if (await grokSessionBusy(f.id)) return { ok: false, error: { code: 'grok-session-open' } }
   // The working-folder level under ~/.grok/sessions goes too once its last session is gone.
   const failures = await trashPaths(folders.filter((x) => kinds.includes(x.kind)).map((f) => f.path), true)
   return failures.length ? { ok: false, error: { code: 'trash-failed', files: failures } } : { ok: true }
@@ -656,9 +702,19 @@ async function runGrokResidue(projects: ProjectSummary[], kinds: DeleteKind[]): 
 
 const RECENT_MS = 24 * 3_600_000
 
-async function hasReply(file: string): Promise<boolean> {
+async function hasConversation(file: string): Promise<boolean> {
   try {
-    return (await fs.readFile(file)).includes('"type":"assistant"')
+    let found = false
+    const offset = await readLines(file, 0, (line) => {
+      if (found) return
+      try {
+        const r = JSON.parse(line.toString('utf8')) as RawRecord
+        found = r.type === 'assistant' || (r.type === 'user' && classifyUser(r)?.kind === 'prompt')
+      } catch {
+        found = true
+      }
+    })
+    return found || offset < (await fs.stat(file)).size
   } catch {
     return true
   }
@@ -671,8 +727,8 @@ async function recentlyUsed(path: string, depth = 2): Promise<boolean> {
     if (Date.now() - st.mtimeMs < RECENT_MS) return true
     if (!st.isDirectory() || depth === 0) return false
     for (const e of await fs.readdir(path)) if (await recentlyUsed(join(path, e), depth - 1)) return true
-  } catch {
-    /* gone or unreadable */
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ENOENT'
   }
   return false
 }
@@ -682,7 +738,8 @@ const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 async function dirNames(path: string): Promise<string[]> {
   try {
     return (await fs.readdir(path, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name)
-  } catch {
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     return []
   }
 }
@@ -697,35 +754,53 @@ async function planClaudeResidue(projects: ProjectSummary[]) {
   const listed = new Set(projects.filter((p) => p.source === 'claude').flatMap((p) => p.sessions.flatMap((s) => s.versions.map((v) => v.id))))
   const live = await liveSessionIds()
   const known = new Set<string>()
+  const copies = new Map<string, number>()
+  const empty: SessionVersion[] = []
+  const memoryDirs = new Set(projects.filter((p) => p.source === 'claude').map((p) => projectMemoryDir(p.path).toLowerCase()))
   /** Project folders with a session open in Claude Code */
   const liveDirs = new Set<string>()
   const paths: { path: string; kind: DeleteKind }[] = []
+  const folders: { dir: string; names: string[]; ids: string[] }[] = []
   for (const dir of await dirNames(PROJECTS_DIR)) {
-    let names: string[]
-    try {
-      names = await fs.readdir(join(PROJECTS_DIR, dir))
-    } catch {
-      continue
-    }
+    const names = await fs.readdir(join(PROJECTS_DIR, dir))
     const ids = names.filter((n) => n.endsWith('.jsonl')).map((n) => n.slice(0, -6))
-    for (const id of ids) known.add(id)
-    if (ids.some((id) => live.has(id))) liveDirs.add(dir.toLowerCase())
+    folders.push({ dir, names, ids })
+    for (const id of ids) {
+      known.add(id)
+      copies.set(id, (copies.get(id) ?? 0) + 1)
+    }
+    if ([...ids, ...names].some((id) => live.has(id))) liveDirs.add(dir.toLowerCase())
+  }
+  const orphan = (id: string) => SESSION_ID.test(id) && !known.has(id) && !live.has(id)
+  for (const { dir, names, ids } of folders) {
     if (!ids.length) {
       // A project without sessions: only its memory has value, so that starts unchecked.
-      for (const n of names) paths.push({ path: join(PROJECTS_DIR, dir, n), kind: n === 'memory' ? 'memory' : 'artifacts' })
+      if (liveDirs.has(dir.toLowerCase())) continue
+      for (const n of names) {
+        if (SESSION_ID.test(n) && !orphan(n)) continue
+        const path = join(PROJECTS_DIR, dir, n)
+        if (n.toLowerCase() === 'memory' && memoryDirs.has(path.toLowerCase())) continue
+        paths.push({ path, kind: n.toLowerCase() === 'memory' ? 'memory' : 'artifacts' })
+      }
       continue
     }
     for (const id of ids) {
       // Unlisted because no prompt was typed; one Claude answered (a slash command or skill run) is a conversation.
-      if (!listed.has(id) && !live.has(id) && !(await hasReply(join(PROJECTS_DIR, dir, id + '.jsonl')))) {
-        paths.push(...versionPaths({ id, dir, title: '', lastActivity: 0, promptCount: 0 }))
+      const file = join(PROJECTS_DIR, dir, id + '.jsonl')
+      if (!listed.has(id) && !live.has(id) && !(await recentlyUsed(file)) && !(await hasConversation(file))) {
+        empty.push({ id, dir, title: '', lastActivity: 0, promptCount: 0 })
       }
     }
     for (const n of names) {
-      if (SESSION_ID.test(n) && !ids.includes(n)) paths.push({ path: join(PROJECTS_DIR, dir, n), kind: 'artifacts' })
+      if (orphan(n)) paths.push({ path: join(PROJECTS_DIR, dir, n), kind: 'artifacts' })
     }
   }
-  const orphan = (id: string) => SESSION_ID.test(id) && !known.has(id) && !live.has(id)
+  const emptyCopies = new Map<string, number>()
+  for (const v of empty) emptyCopies.set(v.id, (emptyCopies.get(v.id) ?? 0) + 1)
+  for (const v of empty) {
+    // Rewind backups and sidecars can still be used by a nonempty copy in another project folder.
+    paths.push(...versionPaths(v).filter((p) => p.kind === 'sessions' || emptyCopies.get(v.id) === copies.get(v.id)))
+  }
   for (const id of (await dirNames(join(CLAUDE_DIR, 'file-history'))).filter(orphan)) paths.push({ path: join(CLAUDE_DIR, 'file-history', id), kind: 'history' })
   for (const id of (await dirNames(join(CLAUDE_DIR, 'session-env'))).filter(orphan)) paths.push({ path: join(CLAUDE_DIR, 'session-env', id), kind: 'artifacts' })
   const temp = join(tmpdir(), 'claude')

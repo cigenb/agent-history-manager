@@ -136,7 +136,9 @@ test('finds leftovers of threads that are no longer indexed, with evidence, and 
   const unknown = '01a00000-0000-7000-8000-000000000004'
   const ws = join(home, 'ws', '2026-01-02')
   const out = join(ws, 'old', 'outputs')
+  const cloudOut = join(ws, 'cloud', 'outputs')
   await mkdir(out, { recursive: true })
+  await mkdir(cloudOut, { recursive: true })
   await mkdir(join(ws, 'busy'), { recursive: true })
   const rw = new DatabaseSync(join(home, 'state_5.sqlite'))
   rw.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run('busy-thread', 'r9', 1, 1, 'vscode', '\\\\?\\' + join(ws, 'busy'), 'Busy', null, 0, 'm')
@@ -146,7 +148,7 @@ test('finds leftovers of threads that are no longer indexed, with evidence, and 
     join(home, '.codex-global-state.json'),
     JSON.stringify({
       ...state,
-      'thread-projectless-output-directories': { ...state['thread-projectless-output-directories'], [deleted]: out, [cloud]: out },
+      'thread-projectless-output-directories': { ...state['thread-projectless-output-directories'], [deleted]: out, [cloud]: cloudOut },
       'thread-workspace-root-hints': { [deleted]: 'x', [cloud]: 'x', [unknown]: 'x' },
       'electron-persisted-atom-state': {
         [`codex-writing-block-deleted-thread-v1:${deleted}`]: true,
@@ -164,4 +166,27 @@ test('finds leftovers of threads that are no longer indexed, with evidence, and 
   // Desktop's own deleted markers survive the cleanup of their thread.
   const { value } = forgetThreads({ [`codex-writing-block-deleted-thread-v1:${deleted}`]: true, [deleted]: 1 }, [deleted])
   assert.deepEqual(value, { [`codex-writing-block-deleted-thread-v1:${deleted}`]: true })
+})
+
+test('Codex keeps indexed threads visible even with no prompt, title or messages', async () => {
+  const rw = new DatabaseSync(join(home, 'state_5.sqlite'))
+  const insert = rw.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+  insert.run('answer-only', 'answer-rollout', 100, 900, 'vscode', 'C:\\work\\app', null, null, 0, 'm')
+  insert.run('empty-thread', 'empty-rollout', 100, 800, 'vscode', 'C:\\work\\app', null, null, 0, 'm')
+  rw.close()
+  const h = new DatabaseSync(join(home, 'thread_history_1.sqlite'))
+  h.prepare('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+    'answer-only', 'a1', 'report', ++ordinal, 9000,
+    JSON.stringify({ type: 'agentMessage', text: 'Standalone report', phase: 'final_answer' }), 'agentMessage',
+  )
+  h.close()
+  const projects = await scanCodex()
+  const project = projects.find((p) => p.key === 'codex:project:p1')
+  const answer = project.sessions.find((s) => s.id === 'answer-only')
+  const empty = project.sessions.find((s) => s.id === 'empty-thread')
+  assert.ok(answer && empty)
+  assert.equal(answer.headless, false)
+  assert.equal(empty.headless, false)
+  assert.deepEqual(loadCodexSession(project, answer).turns.map((t) => [t.kind, t.text]), [['assistant', 'Standalone report']])
+  assert.deepEqual(loadCodexSession(project, empty).turns, [])
 })

@@ -1,9 +1,9 @@
 import { existsSync, promises as fs, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, extname, join } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, win32 } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { AgentDetail, AgentRun, ImageData, McpUse, ProjectSummary, SessionDetail, SessionSummary, SessionVersion, Turn } from '../shared/types'
-import { projectKeyOf, TEMP_PATTERNS } from './sessions'
+import { projectKeyOf, readLines, TEMP_PATTERNS } from './sessions'
 
 export const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex')
 /** Codex Desktop's own state: projects, thread assignments and per-thread UI entries keyed by thread id */
@@ -72,15 +72,17 @@ export interface CodexThread {
 
 interface GlobalState {
   'local-projects'?: Record<string, { id?: string; name?: string; rootPaths?: string[] }>
-  'thread-project-assignments'?: Record<string, { projectId?: string }>
+  'thread-project-assignments'?: Record<string, { projectId?: string; projectKind?: string }>
   'projectless-thread-ids'?: string[]
   'thread-projectless-output-directories'?: Record<string, string>
+  'electron-persisted-atom-state'?: Record<string, unknown>
 }
 
-export async function readGlobalState(): Promise<GlobalState> {
+export async function readGlobalState(strict = false): Promise<GlobalState> {
   try {
     return JSON.parse(await fs.readFile(CODEX_GLOBAL_STATE, 'utf8')) as GlobalState
-  } catch {
+  } catch (e) {
+    if (strict && (e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     return {}
   }
 }
@@ -170,9 +172,9 @@ export function codexThread(id: string): CodexThread | null {
 
 /** Under a root path, compared case-insensitively as Windows paths are. */
 function within(path: string, root: string): boolean {
-  const p = projectKeyOf(path)
-  const r = projectKeyOf(root)
-  return p === r || p.startsWith(r + '\\') || p.startsWith(r + '/')
+  const p = projectKeyOf(win32.normalize(plainPath(path)))
+  const r = projectKeyOf(win32.normalize(plainPath(root)))
+  return p === r || p.startsWith(r + '\\')
 }
 
 /**
@@ -565,23 +567,36 @@ export function forgetThreads(value: unknown, ids: string[]): { value: unknown; 
  */
 export async function projectlessWorkspaces(state: GlobalState): Promise<{ all: string[]; used: (dir: string) => boolean; contains: (path: string) => string | null }> {
   const db = openDb()
+  if (!db) return { all: [], used: () => true, contains: () => null }
   let cwds: string[] = []
   try {
-    cwds = db ? (db.prepare('SELECT cwd FROM threads').all() as { cwd: string }[]).map((r) => plainPath(r.cwd ?? '')) : []
+    cwds = (db.prepare('SELECT cwd FROM threads').all() as { cwd: string }[]).map((r) => plainPath(r.cwd ?? ''))
   } finally {
-    db?.close()
+    db.close()
   }
   const roots = new Set<string>()
-  for (const out of Object.values(state['thread-projectless-output-directories'] ?? {})) roots.add(dirname(dirname(dirname(plainPath(out)))))
+  for (const out of Object.values(state['thread-projectless-output-directories'] ?? {})) {
+    const path = plainPath(out)
+    if (!isAbsolute(path) || basename(path).toLowerCase() !== 'outputs' || !/^\d{4}-\d{2}-\d{2}$/.test(basename(dirname(dirname(path))))) continue
+    roots.add(dirname(dirname(dirname(path))))
+  }
+  const projectRoots = Object.values(state['local-projects'] ?? {}).flatMap((p) => p.rootPaths ?? []).map(plainPath)
+  const remote = remoteThreadIds(state)
+  for (const [id, out] of Object.entries(state['thread-projectless-output-directories'] ?? {})) {
+    if (remote.has(id)) projectRoots.push(dirname(plainPath(out)))
+  }
   const all: string[] = []
   for (const r of roots) {
     for (const day of await dirNamesOf(r)) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
-      for (const slug of await dirNamesOf(join(r, day))) all.push(join(r, day, slug))
+      for (const slug of await dirNamesOf(join(r, day))) {
+        const dir = join(r, day, slug)
+        if (!projectRoots.some((p) => within(p, dir) || within(dir, p))) all.push(dir)
+      }
     }
   }
   const used = (dir: string) => cwds.some((c) => within(c, dir))
-  const contains = (path: string) => all.find((dir) => within(path, dir) && projectKeyOf(plainPath(path)) === projectKeyOf(dir)) ?? null
+  const contains = (path: string) => all.find((dir) => within(path, dir) && within(dir, path)) ?? null
   return { all, used, contains }
 }
 
@@ -597,6 +612,19 @@ async function dirNamesOf(path: string): Promise<string[]> {
 const DELETED_MARKER = 'codex-writing-block-deleted-thread-v1:'
 
 const THREAD_ID = /[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/g
+
+function remoteThreadIds(state: GlobalState): Set<string> {
+  const remote = new Set<string>()
+  for (const [id, assignment] of Object.entries(state['thread-project-assignments'] ?? {})) {
+    if (assignment.projectKind && assignment.projectKind !== 'local') remote.add(id)
+  }
+  for (const [key, value] of Object.entries(state['electron-persisted-atom-state'] ?? {})) {
+    if (/^(aeon-|cloud-aeon|orbit-)/.test(key)) {
+      for (const id of (key + JSON.stringify(value)).match(THREAD_ID) ?? []) remote.add(id)
+    }
+  }
+  return remote
+}
 /**
  * `rollout-<time>-<thread>.jsonl[.zst]`. Some files carry a second id (`<thread>_<other>`); they belong to the
  * first thread, and Codex's history projection has rows for the second id.
@@ -624,7 +652,8 @@ async function walkRollouts(dir: string, out: RolloutFile[]): Promise<void> {
   let entries
   try {
     entries = await fs.readdir(dir, { withFileTypes: true })
-  } catch {
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     return
   }
   for (const e of entries) {
@@ -660,38 +689,68 @@ export async function scanCodexResidue(): Promise<CodexResidue> {
   } finally {
     db.close()
   }
-  const rollouts = (await codexRolloutFiles()).filter((f) => !live.has(f.id))
+  const files = await codexRolloutFiles()
+  const protectedIds = new Set(files.filter((f) => f.other && live.has(f.other)).map((f) => f.id))
 
-  const state = (await readGlobalState()) as Record<string, unknown>
-  const atoms = (state['electron-persisted-atom-state'] ?? {}) as Record<string, unknown>
+  const state = (await readGlobalState(true)) as Record<string, unknown>
+  const states = [state]
+  try {
+    states.push(JSON.parse(await fs.readFile(CODEX_GLOBAL_STATE + '.bak', 'utf8')) as Record<string, unknown>)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+  }
+  const remote = new Set(states.flatMap((s) => [...remoteThreadIds(s as GlobalState)]))
+  const rollouts = files.filter((f) => !live.has(f.id) && !protectedIds.has(f.id) && !remote.has(f.id))
   const ids = (text: string) => text.match(THREAD_ID) ?? []
   const keysOf = (v: unknown) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v) : [])
   const named = new Set<string>()
-  for (const [k, v] of Object.entries(state)) if (k.startsWith('thread-')) for (const id of keysOf(v)) named.add(id)
-  for (const id of (state['projectless-thread-ids'] as string[] | undefined) ?? []) named.add(id)
   const deleted = new Set<string>()
-  const remote = new Set<string>()
-  for (const [k, v] of Object.entries(atoms)) {
-    if (k.startsWith(DELETED_MARKER)) deleted.add(k.slice(DELETED_MARKER.length))
-    else if (/^(aeon-|cloud-aeon|orbit-)/.test(k)) for (const id of ids(k + JSON.stringify(v))) remote.add(id)
-    else if (k.includes('thread')) for (const id of [...ids(k), ...keysOf(v)]) named.add(id)
+  const local = new Set<string>()
+  for (const snapshot of states) {
+    for (const [k, v] of Object.entries(snapshot)) if (k.startsWith('thread-')) for (const id of keysOf(v)) named.add(id)
+    for (const id of (snapshot['projectless-thread-ids'] as string[] | undefined) ?? []) named.add(id)
+    const atoms = (snapshot['electron-persisted-atom-state'] ?? {}) as Record<string, unknown>
+    for (const [k, v] of Object.entries(atoms)) {
+      if (k.startsWith(DELETED_MARKER)) deleted.add(k.slice(DELETED_MARKER.length))
+      else if (/^(aeon-|cloud-aeon|orbit-)/.test(k)) continue
+      else if (k.includes('thread')) for (const id of [...ids(k), ...keysOf(v)]) named.add(id)
+    }
+    const assignments = (snapshot as GlobalState)['thread-project-assignments'] ?? {}
+    const projects = (snapshot as GlobalState)['local-projects'] ?? {}
+    for (const id of Object.keys(assignments)) {
+      if (assignments[id].projectKind === 'local' || projects[assignments[id].projectId ?? '']) local.add(id)
+    }
+    for (const id of keysOf(snapshot['thread-projectless-output-directories'])) local.add(id)
+    for (const id of (snapshot['projectless-thread-ids'] as string[] | undefined) ?? []) local.add(id)
   }
   for (const id of (await threadNames()).keys()) named.add(id)
-  const local = new Set([
-    ...keysOf(state['thread-project-membership-host-ids']),
-    ...keysOf(state['thread-project-assignments']),
-    ...keysOf(state['thread-projectless-output-directories']),
-    ...((state['projectless-thread-ids'] as string[] | undefined) ?? []),
-  ])
+  try {
+    await readLines(join(CODEX_HOME, 'history.jsonl'), 0, (line) => {
+      try {
+        const row = JSON.parse(line.toString('utf8')) as { session_id?: string }
+        if (row.session_id) named.add(row.session_id)
+      } catch {
+        /* malformed rows are retained */
+      }
+    })
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+  }
   const isThreadId = (id: string) => new RegExp(`^${THREAD_ID.source}$`).test(id)
   const stateIds = [...named].filter((id) => isThreadId(id) && !live.has(id) && !remote.has(id) && (deleted.has(id) || local.has(id)))
 
   const folders: CodexResidue['folders'] = []
   const workspaces = await projectlessWorkspaces(state as GlobalState)
-  for (const dir of workspaces.all) if (!workspaces.used(dir)) folders.push({ path: dir, kind: 'output' })
+  const protectedDirs = states.flatMap((s) => [
+    ...Object.values((s as GlobalState)['local-projects'] ?? {}).flatMap((p) => p.rootPaths ?? []),
+    ...Object.entries((s as GlobalState)['thread-projectless-output-directories'] ?? {}).filter(([id]) => remote.has(id)).map(([, out]) => dirname(plainPath(out))),
+  ])
+  for (const dir of workspaces.all) {
+    if (!workspaces.used(dir) && !protectedDirs.some((p) => within(p, dir) || within(dir, p))) folders.push({ path: dir, kind: 'output' })
+  }
   try {
     for (const name of await fs.readdir(join(CODEX_HOME, 'generated_images'))) {
-      if (!live.has(name) && /^[0-9a-f-]{36}$/.test(name)) folders.push({ path: join(CODEX_HOME, 'generated_images', name), kind: 'artifacts' })
+      if (!live.has(name) && !remote.has(name) && /^[0-9a-f-]{36}$/.test(name)) folders.push({ path: join(CODEX_HOME, 'generated_images', name), kind: 'artifacts' })
     }
   } catch {
     /* no generated images */
@@ -700,9 +759,9 @@ export async function scanCodexResidue(): Promise<CodexResidue> {
 }
 
 /** Ids of indexed threads, subagents included, that work in or below a folder. */
-export function codexThreadsIn(dir: string): string[] {
+export function codexThreadsIn(dir: string): string[] | null {
   const db = openDb()
-  if (!db) return []
+  if (!db) return null
   try {
     return (db.prepare('SELECT id, cwd FROM threads').all() as { id: string; cwd: string }[])
       .filter((r) => within(plainPath(r.cwd ?? ''), dir))

@@ -1,4 +1,4 @@
-// Builds fictional Claude Code data for screenshots and can start the packaged app on it, so screenshots never
+// Builds fictional Claude Code and Grok data for screenshots and can start the packaged app on it, so screenshots never
 // show real projects or conversations. Everything lives under one folder (default `.demo` in the repo):
 //
 //   node scripts/make-demo-data.mjs [--root <dir>] [--launch]
@@ -368,6 +368,17 @@ for (const m of memories) {
 // ---- two smaller projects so the sidebar looks lived-in ----------------------
 
 const cli = await project('cli-toolkit')
+await session(cli, 'doctor-command', (t) => {
+  t.records.push(t.base({ type: 'system', subtype: 'local_command', content: '<command-name>/doctor</command-name>' }))
+  t.say('CLI installation and configuration checks passed.', true)
+})
+const grokReport = uuidFrom('grok:cli-toolkit:background-report')
+const grokDir = join(home, '.grok', 'sessions', encodeURIComponent(cli.cwd), grokReport)
+await write(join(grokDir, 'summary.json'), JSON.stringify({ info: { id: grokReport, cwd: cli.cwd }, session_kind: null, last_active_at: iso(0) }))
+await write(join(grokDir, 'updates.jsonl'), [
+  { timestamp: BASE / 1000, params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Background configuration check completed.' } } } },
+  { timestamp: BASE / 1000, params: { update: { sessionUpdate: 'turn_completed' } } },
+].map((r) => JSON.stringify(r)).join('\n') + '\n')
 const changelog = join(cli.cwd, 'CHANGELOG.md')
 const CHANGELOG = '# Changelog\n\n## 1.2.0\n\n- `--json` output for every command\n- `sync`: automatic retry for transient network errors (up to 3 attempts)\n- Faster startup: config is parsed lazily\n'
 await write(changelog, CHANGELOG)
@@ -413,7 +424,7 @@ if (argv.includes('--launch')) {
     process.exit(1)
   }
   spawn(exe, [`--data-dir=${appData}`], {
-    env: { ...process.env, USERPROFILE: home, TEMP: tempDir, TMP: tempDir },
+    env: { ...process.env, USERPROFILE: home, CODEX_HOME: join(home, '.codex'), GROK_HOME: join(home, '.grok'), TEMP: tempDir, TMP: tempDir },
     detached: true,
     stdio: 'ignore',
   }).unref()

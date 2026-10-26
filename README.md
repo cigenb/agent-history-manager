@@ -50,7 +50,7 @@ Quit Codex Desktop completely before deleting: it keeps its state in memory and 
 
 Grok's own subagents are listed in the right panel and can be opened.
 
-**Check Grok leftovers** (see [Leftover check](#leftover-check)) lists session folders the list doesn't show: empty sessions without a prompt or a reply, unreadable sessions, and subagent sessions whose parent was deleted. They go to the Recycle Bin.
+**Check Grok leftovers** (see [Leftover check](#leftover-check)) lists session folders the list doesn't show: empty sessions without a prompt or a reply, and subagent sessions whose parent was deleted. They go to the Recycle Bin. Top-level sessions with unreadable or incomplete logs are kept.
 
 Deleting a Grok conversation is permanent: it runs `grok sessions delete` for the session and the sessions of its subagents, which may also remove history stored remotely. Subagent session folders the Grok CLI leaves behind go to the Recycle Bin. Sessions open in Grok cannot be deleted or resumed.
 
@@ -67,6 +67,7 @@ Claude Code keeps per-project memories as Markdown files in `~/.claude/projects/
 - A link to the conversation that wrote each memory.
 - **Delete**: links to the memory in other memory files are struck through and marked as deleted rather than left broken, so Claude can tell it was removed on purpose.
 - **Backups**: every deletion is backed up, with the original versions of every file it changed, and can be restored in one click. If those files changed again afterwards, you are asked before they are overwritten.
+- Reference updates match local memory links; links to websites or other folders and code examples are kept. Deletion and restoration do not follow symbolic links or junctions.
 
 ![Memory panel](docs/screenshots/memory.png)
 
@@ -77,6 +78,7 @@ Conversations refresh as the agents write them, and Claude Code conversations th
 - Only prompts and replies are shown, with Markdown rendered. Codex attachments are shown as images when the pasted file still exists. Commentary written between tool calls is folded; tool calls, tool output, and thinking are left out. When the agent continues on its own (for example after a subagent reports back), each reply stays separate.
 - **Markdown edits** made by Claude Code appear as diff cards. **Preview** opens the file's current content in the right panel with the changed lines highlighted.
 - **Subagents and MCP calls** are listed in the right panel with their status. Click a subagent to read its own conversation.
+- Claude Code records with commands or replies but no prompt, and Grok records with replies but no prompt, appear under **Temporary & scripted only**, where they can be viewed, searched, and deleted. Indexed Codex conversations remain listed even before their first prompt or reply.
 - **Open in terminal** opens a Windows Terminal tab in the project folder: on a conversation it resumes it, on a project it starts a new conversation.
 
 ## Search

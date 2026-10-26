@@ -51,6 +51,7 @@ export function translateError(t: Dictionary, error: ActionError | undefined, fa
     case 'project-missing': return t.errorProjectMissing
     case 'name-empty': return t.errorNameEmpty
     case 'memory-missing': return t.memoryMissing
+    case 'memory-linked-path': return t.errorMemoryLinkedPath(error.path)
     case 'backup-missing': return t.errorBackupMissing
     case 'trash-failed': return t.errorTrash(error.files.join('\n'))
     case 'directory-missing': return t.errorDirectory(error.path)

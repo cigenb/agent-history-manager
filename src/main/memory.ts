@@ -11,9 +11,38 @@ import type {
   ProjectMemory,
   ProjectSummary,
 } from '../shared/types'
-import { projectMemoryDir } from './sessions'
+import { projectMemoryDir, SAFE_SEGMENT } from './sessions'
 
 const INDEX_FILE = 'MEMORY.md'
+
+async function linkedMemoryPath(dir: string, files: string[]): Promise<string | null> {
+  for (const path of [dirname(dir), dir, ...files.map((f) => join(dir, f))]) {
+    try {
+      if ((await fs.lstat(path)).isSymbolicLink()) return path
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+  }
+  return null
+}
+
+/** Mask code while preserving offsets, so examples are not treated as references. */
+function visibleMarkdown(text: string): string {
+  let fence: { char: string; length: number } | null = null
+  return text.split(/(\r?\n)/).map((line, i) => {
+    if (i % 2) return line
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+    if (fence) {
+      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.length && !marker[2].trim()) fence = null
+      return ' '.repeat(line.length)
+    }
+    if (marker) {
+      fence = { char: marker[1][0], length: marker[1].length }
+      return ' '.repeat(line.length)
+    }
+    return line.replace(/(?<!`)(`+)(?!`)(.*?)\1(?!`)/g, (m) => ' '.repeat(m.length))
+  }).join('')
+}
 
 function unquote(v: string): string {
   const s = v.trim()
@@ -54,7 +83,8 @@ function parseFrontmatter(text: string): { fields: Record<string, string>; body:
 /** `[Title](file.md)` links in MEMORY.md, keyed by lower-cased file name */
 function indexLinks(index: string): Map<string, string> {
   const links = new Map<string, string>()
-  for (const m of index.matchAll(/\[([^\]]+)\]\(([^)\s]+\.md)\)/gi)) {
+  for (const m of visibleMarkdown(index).matchAll(/(?<!!)\[([^\]\r\n]+)\]\(((?:\.[\\/])?[^\\/:)\r\n]+\.md)(?:#[^)\s]*)?\)/gi)) {
+    if (index.slice(0, m.index).endsWith('~~')) continue
     const file = basename(m[2].replace(/\\/g, '/')).toLowerCase()
     if (!links.has(file)) links.set(file, m[1].trim())
   }
@@ -110,29 +140,29 @@ export async function getProjectMemory(project: ProjectSummary): Promise<Project
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 /** Links to the target: `[text](file.md)` (optionally `./`) and `[[name]]` / `[[name|alias]]`. */
-function targetLinkRe(target: MemoryFile): RegExp {
+function targetLinkRe(target: MemoryFile, aliases: string[]): RegExp {
   const file = escapeRe(target.file)
-  const names = [...new Set([target.name, target.file.replace(/\.md$/i, '')])].map(escapeRe).join('|')
-  return new RegExp(`\\[[^\\]]*\\]\\((?:\\.[\\\\/])?${file}\\)|\\[\\[\\s*(?:${names})\\s*(?:\\|[^\\]]*)?\\]\\]`, 'gi')
+  const names = [...new Set(aliases)].map(escapeRe).join('|')
+  return new RegExp(`(?<!!)\\[[^\\]]*\\]\\((?:\\.[\\\\/])?${file}(?:#[^)\\s]*)?\\)|\\[\\[\\s*(?:${names})\\s*(?:\\|[^\\]]*)?\\]\\]`, 'gi')
 }
 
-const ANY_MEMORY_LINK = /\[[^\]]*\]\([^)\s]+\.md\)|\[\[[^\]]+\]\]/gi
+const ANY_LINK = /!?\[[^\]]*\]\([^)]+\)|\[\[[^\]]+\]\]/g
 
 /**
  * Rewrites one file's links to the target. In the index, a list line whose only memory link is the target is
  * removed; everywhere else the link is struck through and marked, leaving the sentence intact. Links already
  * struck through are left alone, so running this twice changes nothing.
  */
-function rewriteLinks(text: string, target: MemoryFile, isIndex: boolean, note: string): { text: string; lines: MemoryLineChange[] } {
+function rewriteLinks(text: string, target: MemoryFile, aliases: string[], isIndex: boolean, note: string): { text: string; lines: MemoryLineChange[] } {
   const parts = text.split(/(\r?\n)/) // even indexes are lines, odd ones the line breaks
+  const visible = visibleMarkdown(text).split(/(\r?\n)/)
   const changes: MemoryLineChange[] = []
   const drop = new Set<number>()
   for (let i = 0; i < parts.length; i += 2) {
     const line = parts[i]
-    const re = targetLinkRe(target)
-    const hits = [...line.matchAll(re)].filter((m) => !line.slice(0, m.index).endsWith('~~'))
+    const hits = [...visible[i].matchAll(targetLinkRe(target, aliases))].filter((m) => !line.slice(0, m.index).endsWith('~~'))
     if (hits.length === 0) continue
-    const total = line.match(ANY_MEMORY_LINK)?.length ?? 0
+    const total = visible[i].match(ANY_LINK)?.length ?? 0
     if (isIndex && /^\s*[-*+]\s/.test(line) && total === hits.length) {
       changes.push({ before: line, after: null })
       drop.add(i)
@@ -140,9 +170,8 @@ function rewriteLinks(text: string, target: MemoryFile, isIndex: boolean, note: 
       drop.add(i + 1 < parts.length ? i + 1 : i - 1)
       continue
     }
-    const after = line.replace(re, (m, offset: number, s: string) =>
-      s.slice(0, offset).endsWith('~~') ? m : `~~${m}~~${note}`,
-    )
+    let after = line
+    for (const m of hits.reverse()) after = after.slice(0, m.index) + `~~${m[0]}~~${note}` + after.slice(m.index + m[0].length)
     changes.push({ before: line, after })
     parts[i] = after
   }
@@ -162,20 +191,20 @@ async function prepareDelete(project: ProjectSummary, file: string, live: Set<st
 
   const changes: MemoryFileChange[] = []
   const writes: { path: string; text: string }[] = []
-  const indexName = (await fs.readdir(memory.dir)).find((n) => n.toLowerCase() === INDEX_FILE.toLowerCase())
-  const candidates = [
-    ...(indexName ? [{ file: indexName, path: join(memory.dir, indexName), label: INDEX_FILE, isIndex: true }] : []),
-    ...memory.files
-      .filter((f) => f !== target)
-      .map((f) => ({ file: f.file, path: f.path, label: f.title || f.name, isIndex: false })),
-  ]
+  const aliases = [target.file.replace(/\.md$/i, '')]
+  const name = target.name.toLowerCase()
+  if (!memory.files.some((f) => f !== target && (f.name.toLowerCase() === name || f.file.replace(/\.md$/i, '').toLowerCase() === name))) aliases.push(target.name)
+  const candidates = (await fs.readdir(memory.dir, { withFileTypes: true }))
+    .filter((e) => e.isFile() && /\.md$/i.test(e.name) && e.name.toLowerCase() !== target.file.toLowerCase())
   for (const c of candidates) {
-    const raw = await fs.readFile(c.path, 'utf8').catch(() => null)
-    if (raw === null) continue
-    const r = rewriteLinks(raw, target, c.isIndex, note)
+    const path = join(memory.dir, c.name)
+    const raw = await fs.readFile(path, 'utf8')
+    const isIndex = c.name.toLowerCase() === INDEX_FILE.toLowerCase()
+    const file = memory.files.find((f) => f.file === c.name)
+    const r = rewriteLinks(raw, target, aliases, isIndex, note)
     if (r.lines.length === 0) continue
-    changes.push({ file: c.file, label: c.label, lines: r.lines })
-    writes.push({ path: c.path, text: r.text })
+    changes.push({ file: c.name, label: isIndex ? INDEX_FILE : file?.title || file?.name || c.name, lines: r.lines })
+    writes.push({ path, text: r.text })
   }
 
   const projectLive = project.sessions.some((s) => s.versions.some((v) => live.has(v.id)))
@@ -239,10 +268,24 @@ export async function runMemoryDelete(
   backupRoot: string,
   note: string,
 ): Promise<ActionResult> {
-  const prep = await prepareDelete(project, file, live, note)
+  let prep: PreparedDelete | null
+  try {
+    prep = await prepareDelete(project, file, live, note)
+    if (prep) {
+      const linked = await linkedMemoryPath(dirname(prep.targetPath), [basename(prep.targetPath), ...prep.writes.map((w) => basename(w.path))])
+      if (linked) return { ok: false, error: { code: 'memory-linked-path', path: linked } }
+    }
+  } catch (e) {
+    return { ok: false, error: { code: 'backup-failed', detail: (e as Error).message } }
+  }
   if (!prep) return { ok: false, error: { code: 'memory-missing' } }
-  const id = new Date().toISOString().replace(/[:.]/g, '-')
-  const backupDir = join(backupRoot, id)
+  let backupDir: string
+  try {
+    await fs.mkdir(backupRoot, { recursive: true })
+    backupDir = await fs.mkdtemp(join(backupRoot, new Date().toISOString().replace(/[:.]/g, '-') + '-'))
+  } catch (e) {
+    return { ok: false, error: { code: 'backup-failed', detail: (e as Error).message } }
+  }
   const manifest: BackupManifest = {
     version: 1,
     time: new Date().toISOString(),
@@ -252,7 +295,6 @@ export async function runMemoryDelete(
   }
   const writeManifest = () => fs.writeFile(join(backupDir, MANIFEST), JSON.stringify(manifest, null, 2))
   try {
-    await fs.mkdir(backupDir, { recursive: true })
     for (const w of prep.writes) await fs.copyFile(w.path, join(backupDir, basename(w.path)))
     await writeManifest()
     await moveFile(prep.targetPath, join(backupDir, basename(prep.targetPath)))
@@ -277,8 +319,11 @@ export async function runMemoryDelete(
 async function readManifest(backupRoot: string, id: string): Promise<BackupManifest | null> {
   if (!BACKUP_ID.test(id)) return null
   try {
+    if (!(await fs.lstat(join(backupRoot, id))).isDirectory() || !(await fs.lstat(join(backupRoot, id, MANIFEST))).isFile()) return null
     const m = JSON.parse(await fs.readFile(join(backupRoot, id, MANIFEST), 'utf8')) as BackupManifest
-    return m.version === 1 ? m : null
+    const files = [m.deleted.file, ...m.rewritten.map((r) => r.file)]
+    return m.version === 1 && typeof m.memoryDir === 'string' && typeof m.time === 'string' &&
+      files.every((f) => typeof f === 'string' && SAFE_SEGMENT.test(f) && /\.md$/i.test(f)) && m.deleted.file.toLowerCase() !== INDEX_FILE.toLowerCase() ? m : null
   } catch {
     return null
   }
@@ -329,13 +374,24 @@ export async function restoreMemoryBackup(
   const m = await readManifest(backupRoot, id)
   const dir = projectMemoryDir(project.path)
   if (!m || m.memoryDir.toLowerCase() !== dir.toLowerCase()) return { ok: false, error: { code: 'backup-missing' } }
+  const backupDir = join(backupRoot, id)
+  const files = [m.deleted.file, ...m.rewritten.map((r) => r.file)]
+  try {
+    const linked = await linkedMemoryPath(dir, files)
+    if (linked) return { ok: false, error: { code: 'memory-linked-path', path: linked } }
+  } catch (e) {
+    return { ok: false, error: { code: 'restore-failed', detail: (e as Error).message, path: backupDir } }
+  }
   const allowed = new Set(overwrite.map((f) => f.toLowerCase()))
   const changed = (await changedSince(m)).filter((f) => !allowed.has(f.toLowerCase()))
   if (changed.length) return { ok: false, error: { code: 'backup-changed', files: changed } }
-  const backupDir = join(backupRoot, id)
   try {
+    for (const f of files) {
+      const st = await fs.lstat(join(backupDir, f))
+      if (!st.isFile()) return { ok: false, error: { code: 'restore-failed', detail: f, path: backupDir } }
+    }
     await fs.mkdir(dir, { recursive: true })
-    for (const f of [m.deleted.file, ...m.rewritten.map((r) => r.file)]) {
+    for (const f of files) {
       await fs.copyFile(join(backupDir, f), join(dir, f))
     }
   } catch (e) {

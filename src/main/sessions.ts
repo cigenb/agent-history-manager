@@ -37,7 +37,7 @@ async function countMemories(path: string): Promise<number> {
   }
 }
 
-const CACHE_VERSION = 5
+const CACHE_VERSION = 6
 
 /** Per-file scan state; persisted so later scans only read bytes appended since `offset`. */
 interface FileIndex {
@@ -50,6 +50,8 @@ interface FileIndex {
   customTitle?: string
   aiTitle?: string
   firstPrompt?: string
+  firstCommand?: string
+  firstAnswer?: string
   firstPromptTs?: number
   lastTs: number
   promptCount: number
@@ -275,11 +277,12 @@ async function indexFile(file: string, prev: FileIndex | undefined, size: number
     }
     if (line.includes(B_SIDECHAIN)) return
     const isUser = line.includes(B_USER)
-    if (!isUser && !line.includes(B_ASSISTANT)) return
+    const isCommand = !isUser && line.includes(B_LOCAL_COMMAND)
+    if (!isUser && !isCommand && !line.includes(B_ASSISTANT)) return
 
     if (!idx.firstCwd) idx.firstCwd = readJsonString(line, B_CWD)
 
-    if (isUser) {
+    if (isUser || isCommand) {
       if (line.includes(B_TOOL_RESULT)) return
       let r: RawRecord
       try {
@@ -288,7 +291,8 @@ async function indexFile(file: string, prev: FileIndex | undefined, size: number
         return
       }
       if (!idx.entrypoint && r.entrypoint) idx.entrypoint = r.entrypoint
-      const u = classifyUser(r)
+      const command = isCommand && typeof r.content === 'string' ? commandText(r.content) : null
+      const u: UserKind = isCommand ? (command ? { kind: 'command', text: command } : null) : classifyUser(r)
       if (!u) return
       const ts = parseTs(r.timestamp)
       if (ts > idx.lastTs) idx.lastTs = ts
@@ -299,11 +303,21 @@ async function indexFile(file: string, prev: FileIndex | undefined, size: number
           idx.firstPrompt = u.text.slice(0, 200)
           idx.firstPromptTs = ts
         }
+      } else if (!idx.firstCommand) {
+        idx.firstCommand = u.text.slice(0, 200)
       }
     } else {
       // Assistant keys follow `message`, so the last timestamp in the line is the top-level one.
       const ts = parseTs(readJsonString(line, B_TIMESTAMP, true))
       if (ts > idx.lastTs) idx.lastTs = ts
+      if (idx.promptCount === 0 && !idx.firstAnswer && line.includes(B_TEXT_BLOCK)) {
+        try {
+          const r = JSON.parse(line.toString('utf8')) as RawRecord
+          idx.firstAnswer = blocks(r.message?.content).find((b) => b.type === 'text' && b.text?.trim())?.text?.trim().slice(0, 200)
+        } catch {
+          /* partial or malformed line */
+        }
+      }
     }
   })
   idx.size = size
@@ -312,7 +326,7 @@ async function indexFile(file: string, prev: FileIndex | undefined, size: number
 }
 
 function sessionTitle(idx: FileIndex): string {
-  const t = idx.customTitle || idx.aiTitle || idx.firstPrompt?.split('\n')[0]
+  const t = idx.customTitle || idx.aiTitle || idx.firstPrompt?.split('\n')[0] || idx.firstCommand || idx.firstAnswer?.split('\n')[0]
   return t?.trim().slice(0, 120) || ''
 }
 
@@ -469,7 +483,7 @@ export class SessionIndex {
           idx = prev
         }
         nextFiles[file] = idx
-        if (idx.promptCount === 0) continue
+        if (idx.promptCount === 0 && !idx.firstCommand && !idx.firstAnswer) continue
         files.push({
           dir,
           idx,
@@ -502,7 +516,7 @@ export class SessionIndex {
         ...primary.version,
         projectKey: key,
         familyActivity: versions[0].lastActivity,
-        headless: primary.idx.entrypoint === 'sdk-cli',
+        headless: primary.idx.entrypoint === 'sdk-cli' || primary.idx.promptCount === 0,
         versions,
       })
     }
@@ -871,7 +885,8 @@ function metaByAgentId(ctx: SessionContext, agentId: string): AgentMeta | undefi
   return undefined
 }
 
-export const SAFE_SEGMENT = /^[^\\/]+$/
+// Windows strips trailing dots and spaces; those aliases must not resolve outside a session folder.
+export const SAFE_SEGMENT = /^(?!.*[. ]$)[^\\/:<>"|?*\x00-\x1f]+$/
 
 export async function loadSession(
   project: ProjectSummary,

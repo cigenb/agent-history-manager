@@ -53,9 +53,11 @@ interface UpdateRecord {
 
 /** Byte keys of the records the viewer uses; JSON string values escape quotes, so these only match structure. */
 const B_USER_CHUNK = Buffer.from('"sessionUpdate":"user_message_chunk"')
+const B_AGENT_CHUNK = Buffer.from('"sessionUpdate":"agent_message_chunk"')
 const B_RECORDS = [
   B_USER_CHUNK,
-  ...['agent_message_chunk', 'tool_call', 'turn_completed', 'subagent_spawned'].map((k) => Buffer.from(`"sessionUpdate":"${k}"`)),
+  B_AGENT_CHUNK,
+  ...['tool_call', 'turn_completed', 'subagent_spawned'].map((k) => Buffer.from(`"sessionUpdate":"${k}"`)),
 ]
 
 function parseRecord(line: Buffer): UpdateRecord | null {
@@ -76,7 +78,7 @@ function parseTs(s: string | undefined): number {
 
 // ---- index scan ------------------------------------------------------------
 
-const CACHE_VERSION = 1
+const CACHE_VERSION = 2
 
 /** Per updates.jsonl scan state; later scans read only bytes appended since `offset`. */
 interface FileIndex {
@@ -85,6 +87,7 @@ interface FileIndex {
   offset: number
   promptCount: number
   firstPrompt?: string
+  firstAnswer?: string
   /** promptIndex of the last user chunk; chunks of one prompt share it */
   lastPromptIndex?: number
 }
@@ -102,9 +105,16 @@ interface GrokSummaryFile {
 async function indexFile(file: string, prev: FileIndex | undefined, size: number, mtimeMs: number): Promise<FileIndex> {
   const idx: FileIndex = prev && size >= prev.offset ? { ...prev } : { size: 0, mtimeMs: 0, offset: 0, promptCount: 0 }
   idx.offset = await readLines(file, idx.offset, (line) => {
-    if (!line.includes(B_USER_CHUNK)) return
+    const isUser = line.includes(B_USER_CHUNK)
+    if (!isUser && (idx.promptCount > 0 || idx.firstAnswer || !line.includes(B_AGENT_CHUNK))) return
     const u = parseRecord(line)?.params?.update
-    const pi = u?._meta?.promptIndex
+    if (!u) return
+    if (u.sessionUpdate === 'agent_message_chunk') {
+      if (idx.promptCount === 0 && !idx.firstAnswer && u.content?.type === 'text') idx.firstAnswer = u.content.text?.trim().slice(0, 200)
+      return
+    }
+    if (u.sessionUpdate !== 'user_message_chunk') return
+    const pi = u._meta?.promptIndex
     if (pi === undefined || pi !== idx.lastPromptIndex) idx.promptCount++
     idx.lastPromptIndex = pi
     if (!idx.firstPrompt && u?.content?.type === 'text' && u.content.text) idx.firstPrompt = cleanPrompt(u.content.text).slice(0, 200)
@@ -206,13 +216,13 @@ export class GrokIndex {
           changed = true
         }
         nextFiles[file] = idx
-        if (idx.promptCount === 0) continue
+        if (idx.promptCount === 0 && !idx.firstAnswer) continue
 
         const path = summary.info?.cwd || decodeFolder(dir)
         const key = KEY_PREFIX + projectKeyOf(path)
         const lastActivity = parseTs(summary.last_active_at || summary.updated_at) || st.mtimeMs
         const prompt = idx.firstPrompt?.split('\n')[0]
-        const title = (summary.title || summary.generated_title || summary.session_summary || prompt || '')
+        const title = (summary.title || summary.generated_title || summary.session_summary || prompt || idx.firstAnswer?.split('\n')[0] || '')
           .trim()
           .slice(0, 120)
         const version: SessionVersion = { id, dir, title, lastActivity, promptCount: idx.promptCount }
@@ -222,7 +232,7 @@ export class GrokIndex {
           ...version,
           projectKey: key,
           familyActivity: lastActivity,
-          headless: summary.session_kind === 'headless',
+          headless: summary.session_kind === 'headless' || idx.promptCount === 0,
           versions: [version],
         })
       }
@@ -444,7 +454,7 @@ export async function loadGrokSession(
 /** Child sessions of a session's subagents, and of theirs, at any depth. */
 export async function grokDescendants(sessionDir: string): Promise<{ id: string; dir: string; parentDir: string }[]> {
   const out: { id: string; dir: string; parentDir: string }[] = []
-  const seen = new Set<string>()
+  const seen = new Set<string>([basename(sessionDir)])
   const queue = [sessionDir]
   while (queue.length) {
     const parentDir = queue.shift()!
@@ -453,6 +463,9 @@ export async function grokDescendants(sessionDir: string): Promise<{ id: string;
       seen.add(id)
       const dir = await findGrokSessionDir(id)
       if (!dir) continue
+      // Metadata can be stale or point at a top-level conversation; only hidden child sessions belong here.
+      const summary = JSON.parse(await fs.readFile(join(dir, 'summary.json'), 'utf8')) as GrokSummaryFile
+      if (!CHILD_KINDS.has(summary.session_kind ?? '')) continue
       out.push({ id, dir, parentDir })
       queue.push(dir)
     }
@@ -482,11 +495,22 @@ export async function grokSearchText(file: string): Promise<string[]> {
   return out
 }
 
-async function hasAgentText(sessionDir: string): Promise<boolean> {
+async function hasConversation(sessionDir: string): Promise<boolean> {
   try {
-    return (await fs.readFile(join(sessionDir, 'updates.jsonl'))).includes('"sessionUpdate":"agent_message_chunk"')
-  } catch {
-    return false
+    const file = join(sessionDir, 'updates.jsonl')
+    let found = false
+    const offset = await readLines(file, 0, (line) => {
+      if (found) return
+      try {
+        const kind = (JSON.parse(line.toString('utf8')) as UpdateRecord).params?.update?.sessionUpdate
+        found = kind === 'user_message_chunk' || kind === 'agent_message_chunk'
+      } catch {
+        found = true
+      }
+    })
+    return found || offset < (await fs.stat(file)).size
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ENOENT'
   }
 }
 
@@ -499,7 +523,8 @@ export async function scanGrokResidue(listed: Set<string>): Promise<{ id: string
   let dirs: string[] = []
   try {
     dirs = (await fs.readdir(GROK_SESSIONS_DIR, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name)
-  } catch {
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     return []
   }
   for (const dir of dirs) {
@@ -507,16 +532,24 @@ export async function scanGrokResidue(listed: Set<string>): Promise<{ id: string
       for (const e of await fs.readdir(join(GROK_SESSIONS_DIR, dir), { withFileTypes: true })) {
         if (e.isDirectory() && SAFE_SEGMENT.test(e.name)) folders.push({ id: e.name, path: join(GROK_SESSIONS_DIR, dir, e.name) })
       }
-    } catch {
-      /* unreadable folder */
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     }
   }
   const named = new Set<string>()
   for (const f of folders) {
     try {
-      for (const child of await fs.readdir(join(f.path, 'subagents'))) named.add(child)
-    } catch {
-      /* no subagents */
+      for (const child of await fs.readdir(join(f.path, 'subagents'))) {
+        named.add(child)
+        try {
+          const meta = JSON.parse(await fs.readFile(join(f.path, 'subagents', child, 'meta.json'), 'utf8')) as SubagentMeta
+          if (meta.child_session_id) named.add(meta.child_session_id)
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+        }
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
     }
   }
   const out: { id: string; path: string; kind: 'sessions' | 'artifacts' }[] = []
@@ -529,7 +562,7 @@ export async function scanGrokResidue(listed: Set<string>): Promise<{ id: string
     }
     if (CHILD_KINDS.has(kind ?? '')) {
       if (!named.has(f.id)) out.push({ ...f, kind: 'artifacts' })
-    } else if (!listed.has(f.id) && !(await hasAgentText(f.path))) {
+    } else if (!listed.has(f.id) && !(await hasConversation(f.path))) {
       // Unlisted for lack of a prompt; one Grok answered anyway is a conversation, not a leftover.
       out.push({ ...f, kind: 'sessions' })
     }

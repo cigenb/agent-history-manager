@@ -183,6 +183,7 @@ const en = {
   errorBackupMissing: 'Backup not found',
   errorBackup: (detail: string) => `Couldn’t save a backup. No files were changed: ${detail}`,
   errorMemoryUpdate: (files: string) => `The memory was deleted, but these files couldn’t be updated: ${files}`,
+  errorMemoryLinkedPath: (path: string) => `Memory deletion and restoration cannot follow symbolic links or junctions: ${path}`,
   errorBackupChanged: (files: string) => `These files changed after you opened the backup list: ${files}. Review the changes before restoring.`,
   errorRestore: (detail: string, path: string) => `Restore incomplete: ${detail}. Your backup is still in ${path}`,
   exportMarkdown: 'Export as Markdown',

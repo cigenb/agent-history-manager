@@ -183,6 +183,7 @@ const zh = {
   errorBackupMissing: '找不到这份备份',
   errorBackup: (detail: string) => `没能存进备份，没有做任何改动：${detail}`,
   errorMemoryUpdate: (files: string) => `记忆已删除，但以下文件没能更新：${files}`,
+  errorMemoryLinkedPath: (path: string) => `删除或还原记忆不能经过符号链接或目录联接：${path}`,
   errorBackupChanged: (files: string) => `备份列表打开后，${files} 又被改过，请确认后再还原`,
   errorRestore: (detail: string, path: string) => `还原没有完成：${detail}。备份仍保留在 ${path}`,
   exportMarkdown: '导出为 Markdown',
