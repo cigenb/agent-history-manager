@@ -1,9 +1,8 @@
 import { app, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
 import { existsSync, promises as fs } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join, sep } from 'node:path'
+import { basename, join } from 'node:path'
 import type {
   ActionResult,
   ActionError,
@@ -26,17 +25,7 @@ import {
   readGlobalState,
   type CodexThread,
 } from './codex'
-import {
-  findGrokSessionDir,
-  GROK_HOME,
-  GROK_MCP_DIR,
-  grokExecutable,
-  grokSessionDir,
-  isGrokKey,
-  readGrokAgents,
-  readMcpTasks,
-  type McpTask,
-} from './grok'
+import { findGrokSessionDir, GROK_HOME, grokExecutable, grokSessionDir, isGrokKey, readGrokAgents } from './grok'
 import { findSession, projectMemoryDir, PROJECTS_DIR } from './sessions'
 
 const CLAUDE_DIR = join(homedir(), '.claude')
@@ -150,7 +139,7 @@ export async function runDelete(
   target: DeleteTarget,
   kinds: DeleteKind[],
 ): Promise<ActionResult> {
-  if (isGrokKey(target.projectKey)) return runGrokDelete(target)
+  if (isGrokKey(target.projectKey)) return runGrokDelete(projects, target)
   if (isCodexKey(target.projectKey)) return runCodexDelete(projects, target, kinds)
   const plan = await planDelete(projects, target)
   if (plan.blocked) return { ok: false, error: plan.blocked }
@@ -285,7 +274,7 @@ export async function renameSession(
  * documented, so any row mentioning the id counts, unless the row names a pid that has exited: Grok cannot
  * prune rows of crashed processes on Windows.
  */
-async function grokSessionOpen(id: string): Promise<boolean> {
+async function grokSessionBusy(id: string): Promise<boolean> {
   let data: unknown
   try {
     data = JSON.parse(await fs.readFile(join(GROK_HOME, 'active_sessions.json'), 'utf8'))
@@ -304,145 +293,61 @@ async function grokSessionOpen(id: string): Promise<boolean> {
   })
 }
 
-/** Open in Grok, or running as a Grok-MCP task: resuming or deleting it now would collide. */
-async function grokSessionBusy(id: string, tasks: McpTask[] = readMcpTasks()): Promise<boolean> {
-  return tasks.some((t) => t.sessionId === id && t.active) || (await grokSessionOpen(id))
-}
-
-interface Locator {
-  python: string
-  manage: string
-}
-
-/** Written by every Grok-MCP server start; deleting registered sessions goes through its manage.py. */
-async function grokMcpLocator(): Promise<Locator | null> {
-  try {
-    const l = JSON.parse(await fs.readFile(join(GROK_MCP_DIR, 'install.json'), 'utf8')) as Partial<Locator>
-    return l.python && l.manage && existsSync(l.manage) ? { python: l.python, manage: l.manage } : null
-  } catch {
-    return null
-  }
-}
-
 function run(file: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    execFile(
-      file,
-      args,
-      { windowsHide: true, timeout: 120_000, env: { ...withoutParentSession(process.env), PYTHONUTF8: '1' } },
-      (error, stdout, stderr) => {
-        const code = error ? (typeof error.code === 'number' ? error.code : 1) : 0
-        resolve({ code, stdout: String(stdout), stderr: String(stderr || (error && code ? error.message : '')) })
-      },
-    )
+    execFile(file, args, { windowsHide: true, timeout: 120_000, env: withoutParentSession(process.env) }, (error, stdout, stderr) => {
+      const code = error ? (typeof error.code === 'number' ? error.code : 1) : 0
+      resolve({ code, stdout: String(stdout), stderr: String(stderr || (error && code ? error.message : '')) })
+    })
   })
 }
 
 const lastLine = (text: string): string => text.trim().split(/\r?\n/).pop() ?? ''
 
-/** Plans that runGrokDelete applies exactly as previewed, per target. */
-interface GrokDeleteJob {
-  /** Grok-MCP cleanup plans, one per client; manage.py refuses one whose files changed since */
-  mcp: { client: string; planFile: string; confirmation: string }[]
-  /** Sessions Grok-MCP does not know, with the child sessions of their subagents */
-  direct: { id: string; dir: string; children: { id: string; dir: string }[] }[]
-}
-
-const grokJobs = new Map<string, GrokDeleteJob>()
-const jobKey = (target: DeleteTarget): string => JSON.stringify(target)
-
-async function discardJob(key: string): Promise<void> {
-  const job = grokJobs.get(key)
-  grokJobs.delete(key)
-  for (const m of job?.mcp ?? []) await fs.rm(m.planFile, { force: true })
-}
-
-/**
- * Grok sessions are deleted permanently: registered ones by Grok-MCP's cleanup (native sessions, task records,
- * logs), the rest with `grok sessions delete`. Neither goes through the Recycle Bin.
- */
-async function planGrokDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<DeletePlan> {
-  const key = jobKey(target)
-  await discardJob(key)
-  const versions = targetVersions(projects, target)
-  const tasks = readMcpTasks()
-  const items: DeleteItem[] = []
-  const job: GrokDeleteJob = { mcp: [], direct: [] }
-  const blockedPlan = async (blocked: ActionError): Promise<DeletePlan> => {
-    for (const m of job.mcp) await fs.rm(m.planFile, { force: true })
-    return { items, blocked, mode: 'grok' }
-  }
-  for (const v of versions) {
-    if (await grokSessionBusy(v.id, tasks)) return blockedPlan({ code: 'grok-session-open' })
-  }
-
-  const registered = new Map(tasks.map((t) => [t.sessionId, t.client]))
-  for (const client of ['claude', 'codex'] as const) {
-    const ids = versions.filter((v) => registered.get(v.id) === client).map((v) => v.id)
-    if (!ids.length) continue
-    const locator = await grokMcpLocator()
-    if (!locator) return blockedPlan({ code: 'grok-mcp-missing' })
-    const planFile = join(tmpdir(), `cc-history-grok-${randomUUID()}.json`)
-    const r = await run(locator.python, [locator.manage, '--client', client, 'cleanup-plan', '--sessions', ...ids, '--out', planFile])
-    if (r.code !== 0) return blockedPlan({ code: 'grok-failed', detail: lastLine(r.stderr) })
-    const plan = JSON.parse(await fs.readFile(planFile, 'utf8')) as {
-      confirmation: string
-      files: { path: string; size: number }[]
-      native_directories: string[]
-      child_sessions: string[]
-      task_directories: string[]
-      log_files: string[]
-    }
-    job.mcp.push({ client, planFile, confirmation: plan.confirmation })
-    const bytes = (path: string) =>
-      plan.files.filter((f) => f.path === path || f.path.startsWith(path + sep)).reduce((n, f) => n + f.size, 0)
-    const children = new Set(plan.child_sessions)
-    for (const d of plan.native_directories) {
-      items.push({ path: d, bytes: bytes(d), kind: children.has(basename(d)) ? 'artifacts' : 'sessions' })
-    }
-    for (const d of [...plan.task_directories, ...plan.log_files]) items.push({ path: d, bytes: bytes(d), kind: 'mcp' })
-  }
-
-  for (const v of versions.filter((x) => !registered.has(x.id))) {
+/** Sessions to delete, each with the child sessions of its subagents; recomputed for every run. */
+async function grokTargets(projects: ProjectSummary[], target: DeleteTarget) {
+  const out: { id: string; dir: string; children: { id: string; dir: string }[] }[] = []
+  for (const v of targetVersions(projects, target)) {
     const dir = grokSessionDir(v)
     const children: { id: string; dir: string }[] = []
     for (const id of (await readGrokAgents(dir)).keys()) {
       const childDir = await findGrokSessionDir(id)
       if (childDir) children.push({ id, dir: childDir })
     }
-    items.push({ path: dir, bytes: (await sizeOf(dir)) ?? 0, kind: 'sessions' })
-    for (const c of children) items.push({ path: c.dir, bytes: (await sizeOf(c.dir)) ?? 0, kind: 'artifacts' })
-    job.direct.push({ id: v.id, dir, children })
+    out.push({ id: v.id, dir, children })
   }
-  grokJobs.set(key, job)
+  return out
+}
+
+/** Grok sessions are deleted permanently with `grok sessions delete`; nothing of them goes to the Recycle Bin first. */
+async function planGrokDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<DeletePlan> {
+  const items: DeleteItem[] = []
+  const sessions = await grokTargets(projects, target)
+  for (const s of sessions) {
+    items.push({ path: s.dir, bytes: (await sizeOf(s.dir)) ?? 0, kind: 'sessions' })
+    for (const c of s.children) items.push({ path: c.dir, bytes: (await sizeOf(c.dir)) ?? 0, kind: 'artifacts' })
+  }
+  for (const s of sessions) {
+    if (await grokSessionBusy(s.id)) return { items, blocked: { code: 'grok-session-open' }, mode: 'grok' }
+  }
   return { items, mode: 'grok' }
 }
 
-async function runGrokDelete(target: DeleteTarget): Promise<ActionResult> {
-  const key = jobKey(target)
-  const job = grokJobs.get(key)
-  if (!job) return { ok: false, error: { code: 'session-missing' } }
-  for (const d of job.direct) {
-    if (await grokSessionBusy(d.id)) return { ok: false, error: { code: 'grok-session-open' } }
+async function runGrokDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<ActionResult> {
+  const sessions = await grokTargets(projects, target)
+  for (const s of sessions) {
+    if (await grokSessionBusy(s.id)) return { ok: false, error: { code: 'grok-session-open' } }
   }
   const failures: string[] = []
-  const locator = job.mcp.length ? await grokMcpLocator() : null
-  for (const m of job.mcp) {
-    const r = locator
-      ? await run(locator.python, [locator.manage, '--client', m.client, 'cleanup', m.planFile, '--confirm', m.confirmation])
-      : { code: 1, stdout: '', stderr: 'Grok-MCP install.json is missing' }
-    if (r.code !== 0) failures.push(lastLine(r.stderr))
-  }
-  for (const d of job.direct) {
-    for (const s of [d, ...d.children]) {
+  for (const session of sessions) {
+    for (const s of [session, ...session.children]) {
       const r = await run(grokExecutable(), ['sessions', 'delete', s.id])
       if (!existsSync(s.dir)) continue
       // The CLI skips the local folders of hidden subagent sessions; those go to the Recycle Bin instead.
-      if (s === d) failures.push(lastLine(r.stderr || r.stdout) || s.dir)
+      if (s === session) failures.push(lastLine(r.stderr || r.stdout) || s.dir)
       else await shell.trashItem(s.dir).catch(() => failures.push(s.dir))
     }
   }
-  await discardJob(key)
   return failures.length ? { ok: false, error: { code: 'grok-failed', detail: failures.join('\n') } } : { ok: true }
 }
 

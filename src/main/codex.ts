@@ -1,8 +1,8 @@
-import { existsSync, promises as fs, readdirSync, statSync } from 'node:fs'
+import { existsSync, promises as fs, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, extname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import type { ProjectSummary, SessionDetail, SessionSummary, SessionVersion } from '../shared/types'
+import type { AgentDetail, AgentRun, ImageData, McpUse, ProjectSummary, SessionDetail, SessionSummary, SessionVersion, Turn } from '../shared/types'
 import { projectKeyOf, TEMP_PATTERNS } from './sessions'
 
 export const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex')
@@ -13,19 +13,37 @@ const KEY_PREFIX = 'codex:'
 export const isCodexKey = (key: string): boolean => key.startsWith(KEY_PREFIX)
 const PROJECTLESS_KEY = KEY_PREFIX + 'projectless'
 
-/** The thread index database; its file name carries a schema number (`state_5.sqlite`). */
-export function codexStateDb(): string | null {
+/** Codex databases carry a schema number in their file name (`state_5.sqlite`); the highest one is current. */
+function codexDb(prefix: 'state' | 'thread_history'): string | null {
   let names: string[]
   try {
     names = readdirSync(CODEX_HOME)
   } catch {
     return null
   }
+  const pattern = new RegExp(`^${prefix}_(\\d+)\\.sqlite$`)
   const dbs = names
-    .map((n) => /^state_(\d+)\.sqlite$/.exec(n))
+    .map((n) => pattern.exec(n))
     .filter((m): m is RegExpExecArray => !!m)
     .sort((a, b) => Number(b[1]) - Number(a[1]))
   return dbs.length ? join(CODEX_HOME, dbs[0][0]) : null
+}
+
+/** The thread index database. */
+export const codexStateDb = (): string | null => codexDb('state')
+
+/** Codex records some working folders with the `\\?\` long-path prefix; compare and show them without it. */
+export function plainPath(path: string): string {
+  return path.startsWith('\\\\?\\UNC\\') ? '\\\\' + path.slice(8) : path.startsWith('\\\\?\\') ? path.slice(4) : path
+}
+
+/**
+ * Codex Desktop sends attachments ahead of the prompt as "# Files mentioned by the user: … ## My request for
+ * Codex:" (older versions: "## My request:"); only the request is the prompt.
+ */
+export function codexRequest(text: string): string {
+  const marker = /^## My request[^:\n]*:[ \t]*/m.exec(text)
+  return text.trimStart().startsWith('# Files mentioned by the user') && marker ? text.slice(marker.index + marker[0].length).trim() : text
 }
 
 /** Codex Desktop installs its CLI under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\; old hash folders may be empty. */
@@ -70,8 +88,8 @@ export async function readGlobalState(): Promise<GlobalState> {
   }
 }
 
-function openDb(): DatabaseSync | null {
-  const path = codexStateDb()
+function openDb(prefix: 'state' | 'thread_history' = 'state'): DatabaseSync | null {
+  const path = codexDb(prefix)
   if (!path) return null
   try {
     return new DatabaseSync(path, { readOnly: true })
@@ -104,8 +122,8 @@ function readThreads(db: DatabaseSync): CodexThread[] {
     created: r.created_at * 1000,
     updated: r.updated_at * 1000,
     source: r.source,
-    cwd: r.cwd,
-    title: (r.title || r.first_user_message?.split('\n')[0] || '').trim().slice(0, 120),
+    cwd: plainPath(r.cwd),
+    title: codexRequest(r.title || r.first_user_message || '').split('\n')[0].trim().slice(0, 120),
     archived: !!r.archived,
   }))
 }
@@ -135,7 +153,7 @@ export function codexDescendants(ids: string[]): CodexThread[] {
               created: Number(r.created_at) * 1000,
               updated: Number(r.updated_at) * 1000,
               source: String(r.source ?? ''),
-              cwd: String(r.cwd ?? ''),
+              cwd: plainPath(String(r.cwd ?? '')),
               title: String(r.title ?? ''),
               archived: !!r.archived,
             })
@@ -183,6 +201,7 @@ export async function scanCodex(): Promise<ProjectSummary[]> {
     db.close()
   }
   const state = await readGlobalState()
+  const names = await threadNames()
   const projects = Object.values(state['local-projects'] ?? {}).filter((p) => p.id && p.rootPaths?.length)
   const assignments = state['thread-project-assignments'] ?? {}
   const projectless = new Set(state['projectless-thread-ids'] ?? [])
@@ -205,7 +224,8 @@ export async function scanCodex(): Promise<ProjectSummary[]> {
     }
     let g = groups.get(key)
     if (!g) groups.set(key, (g = { ...group, sessions: [] }))
-    const version: SessionVersion = { id: t.id, dir: '', title: t.title, lastActivity: t.updated, promptCount: 0 }
+    // `dir` holds the rollout file, which content search watches for changes.
+    const version: SessionVersion = { id: t.id, dir: t.rolloutPath, title: names.get(t.id) || t.title, lastActivity: t.updated, promptCount: 0 }
     g.sessions.push({
       ...version,
       projectKey: key,
@@ -233,10 +253,216 @@ export async function scanCodex(): Promise<ProjectSummary[]> {
   return out.sort((a, b) => b.lastActivity - a.lastActivity)
 }
 
-/** Codex conversations are not shown here, only what identifies them; their content stays in Codex Desktop. */
+/** Thread names as Codex Desktop shows them (`/rename` or generated), latest entry per thread. */
+async function threadNames(): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  let text = ''
+  try {
+    text = await fs.readFile(join(CODEX_HOME, 'session_index.jsonl'), 'utf8')
+  } catch {
+    return out
+  }
+  for (const line of text.split('\n')) {
+    try {
+      const r = JSON.parse(line) as { id?: string; thread_name?: string }
+      if (r.id && r.thread_name) out.set(r.id, r.thread_name.trim().slice(0, 120))
+    } catch {
+      /* partial line */
+    }
+  }
+  return out
+}
+
+interface ItemRow {
+  turn_id: string
+  item_type: string
+  item_json: string
+  created_at_ms: number
+}
+
+interface CodexItem {
+  content?: { type?: string; text?: string; path?: string; url?: string }[]
+  text?: string
+  phase?: string
+  server?: string
+  tool?: string
+  status?: string
+  agentThreadId?: string
+}
+
+const IMAGE_TYPES: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' }
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+/** A pasted image is a temporary file that may be gone; a data URL carries the image itself. */
+function promptImage(c: { type?: string; path?: string; url?: string }): ImageData | null {
+  try {
+    if (c.type === 'localImage' && c.path && IMAGE_TYPES[extname(c.path).toLowerCase()] && statSync(c.path).size <= MAX_IMAGE_BYTES) {
+      return { mediaType: IMAGE_TYPES[extname(c.path).toLowerCase()], data: readFileSync(c.path).toString('base64') }
+    }
+    const m = c.type === 'image' && c.url ? /^data:([^;]+);base64,(.*)$/s.exec(c.url) : null
+    return m ? { mediaType: m[1], data: m[2] } : null
+  } catch {
+    return null
+  }
+}
+
+const TOOL_ITEMS = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'webSearch'])
+
+/** Subagent threads a thread started directly, keyed by thread id. */
+function codexAgentRuns(parentId: string): Map<string, AgentRun> {
+  const out = new Map<string, AgentRun>()
+  const state = openDb()
+  if (!state) return out
+  const history = openDb('thread_history')
+  try {
+    const children = state
+      .prepare(
+        `SELECT t.id, t.source, t.model FROM thread_spawn_edges e JOIN threads t ON t.id = e.child_thread_id
+         WHERE e.parent_thread_id = ?`,
+      )
+      .all(parentId) as { id: string; source: string; model: string | null }[]
+    for (const c of children) {
+      let spawn: { agent_path?: string | null; agent_nickname?: string | null; agent_role?: string | null } = {}
+      try {
+        spawn = JSON.parse(c.source)?.subagent?.thread_spawn ?? {}
+      } catch {
+        /* not JSON */
+      }
+      const last = history?.prepare('SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1').get(c.id) as
+        | { status: string }
+        | undefined
+      const items = history?.prepare('SELECT item_type FROM thread_items WHERE thread_id = ?').all(c.id) as { item_type: string }[] | undefined
+      out.set(c.id, {
+        id: c.id,
+        description: spawn.agent_path?.split('/').pop() || spawn.agent_nickname || '',
+        type: spawn.agent_role || spawn.agent_nickname || 'subagent',
+        model: c.model ?? undefined,
+        state: last?.status === 'completed' ? 'done' : last && last.status !== 'inProgress' ? 'stopped' : 'open',
+        toolCalls: items?.filter((i) => TOOL_ITEMS.has(i.item_type)).length ?? 0,
+      })
+    }
+  } catch {
+    /* schema changed: no subagents shown */
+  } finally {
+    state.close()
+    history?.close()
+  }
+  return out
+}
+
+/**
+ * Visible turns of a Codex thread, from Codex's own history projection (`thread_history_<n>.sqlite`): prompts,
+ * and per turn the `final_answer` message with the `commentary` messages before it as steps. A turn that starts
+ * without a prompt (a subagent reporting back, a queued follow-up) gets a `resume` marker.
+ */
+export function readCodexTurns(threadId: string, images = true): { turns: Turn[]; firstTime: number; lastTime: number } | null {
+  const db = openDb('thread_history')
+  if (!db) return null
+  let rows: ItemRow[]
+  try {
+    rows = db
+      .prepare('SELECT turn_id, item_type, item_json, created_at_ms FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal')
+      .all(threadId) as unknown as ItemRow[]
+  } catch {
+    return null
+  } finally {
+    db.close()
+  }
+  const agents = codexAgentRuns(threadId)
+  const turns: Turn[] = []
+  let firstTime = 0
+  let lastTime = 0
+  let assistant: Extract<Turn, { kind: 'assistant' }> | null = null
+  let messages: { text: string; final: boolean }[] = []
+  let turnId: string | null = null
+  let prompted = false
+  const seenAgents = new Set<string>()
+
+  const close = (): void => {
+    if (assistant) {
+      const finals = messages.filter((m) => m.final)
+      const final = finals.length ? finals[finals.length - 1] : messages[messages.length - 1]
+      assistant.text = final?.text ?? ''
+      assistant.steps = messages.filter((m) => m !== final).map((m) => m.text)
+    }
+    assistant = null
+    messages = []
+  }
+  const open = (ts: number): Extract<Turn, { kind: 'assistant' }> => {
+    if (assistant) return assistant
+    if (!prompted && turns.length) turns.push({ kind: 'resume', source: 'other', time: ts })
+    prompted = true
+    assistant = { kind: 'assistant', text: '', steps: [], edits: [], agents: [], mcp: [], time: ts }
+    turns.push(assistant)
+    return assistant
+  }
+
+  for (const row of rows) {
+    let item: CodexItem
+    try {
+      item = JSON.parse(row.item_json) as CodexItem
+    } catch {
+      continue
+    }
+    const ts = row.created_at_ms || 0
+    if (ts) {
+      if (!firstTime || ts < firstTime) firstTime = ts
+      if (ts > lastTime) lastTime = ts
+    }
+    if (row.turn_id !== turnId) {
+      close()
+      turnId = row.turn_id
+      prompted = false
+    }
+    switch (row.item_type) {
+      case 'userMessage': {
+        close()
+        const parts = item.content ?? []
+        const text = codexRequest(parts.filter((c) => c.type === 'text').map((c) => c.text ?? '').join('\n')).trim()
+        const pics = images ? parts.map(promptImage).filter((i): i is ImageData => !!i) : []
+        if (text || pics.length) turns.push({ kind: 'user', text, images: pics, time: ts })
+        prompted = true
+        break
+      }
+      case 'agentMessage': {
+        if (!item.text?.trim()) break
+        const turn = open(ts)
+        messages.push({ text: item.text.trim(), final: item.phase === 'final_answer' })
+        turn.time = ts || turn.time
+        break
+      }
+      case 'mcpToolCall': {
+        const turn = open(ts)
+        const state: McpUse['state'] = item.status === 'completed' ? 'done' : item.status === 'failed' ? 'error' : 'open'
+        const same = turn.mcp.find((m) => m.server === item.server && m.tool === item.tool)
+        if (!same) turn.mcp.push({ server: item.server ?? '', tool: item.tool ?? '', count: 1, state })
+        else {
+          same.count++
+          if (state === 'open' || (state === 'error' && same.state === 'done')) same.state = state
+        }
+        break
+      }
+      case 'subAgentActivity': {
+        const id = item.agentThreadId
+        if (!id || seenAgents.has(id)) break
+        seenAgents.add(id)
+        open(ts).agents.push(agents.get(id) ?? { id: null, description: '', type: 'subagent', state: 'open', toolCalls: 0 })
+        break
+      }
+      case 'contextCompaction':
+        close()
+        turns.push({ kind: 'compact', time: ts })
+        break
+    }
+  }
+  close()
+  return { turns, firstTime, lastTime }
+}
+
 export function loadCodexSession(project: ProjectSummary, family: SessionSummary): SessionDetail | null {
   const t = codexThread(family.id)
-  if (!t) return null
+  const read = t ? readCodexTurns(t.id) : null
+  if (!t || !read) return null
   return {
     source: 'codex',
     id: t.id,
@@ -244,11 +470,27 @@ export function loadCodexSession(project: ProjectSummary, family: SessionSummary
     projectKey: project.key,
     versions: family.versions,
     path: t.cwd,
-    turns: [],
-    firstTime: t.created,
-    lastTime: t.updated,
-    codex: { cwd: t.cwd, archived: t.archived, subagents: codexDescendants([t.id]).length },
+    ...read,
+    firstTime: read.firstTime || t.created,
+    lastTime: read.lastTime || t.updated,
   }
+}
+
+/** A subagent thread started by thread `parentId`. */
+export function loadCodexAgent(parentId: string, agentId: string): AgentDetail | null {
+  const run = codexAgentRuns(parentId).get(agentId)
+  const read = run ? readCodexTurns(agentId) : null
+  return run && read ? { run, turns: read.turns } : null
+}
+
+/** Prompts and answer text of a thread, the same text the viewer shows, for content search. */
+export function codexSearchText(threadId: string): string[] {
+  const out: string[] = []
+  for (const t of readCodexTurns(threadId, false)?.turns ?? []) {
+    if (t.kind === 'user' && t.text) out.push(t.text)
+    else if (t.kind === 'assistant') out.push(...t.steps, ...(t.text ? [t.text] : []))
+  }
+  return out
 }
 
 /**

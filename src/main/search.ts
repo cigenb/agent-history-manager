@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { searchTerms } from '../shared/search'
 import type { ProjectSummary, SearchHit, SearchResponse, SearchResult, SessionSource, SessionVersion } from '../shared/types'
+import { codexSearchText } from './codex'
 import { grokSearchText, grokUpdatesFile } from './grok'
 import {
   B_ASSISTANT,
@@ -73,8 +74,11 @@ async function readFileText(file: string, prev: FileText | undefined, size: numb
 
 /** Grok logs arrive in chunks that only make sense once assembled, so a changed file is read again in full. */
 async function readGrokText(file: string, size: number, mtimeMs: number): Promise<FileText> {
-  const entries = (await grokSearchText(file)).map((text) => ({ text, lower: text.toLowerCase() }))
-  return { size, mtimeMs, offset: size, entries }
+  return textOf(await grokSearchText(file), size, mtimeMs)
+}
+
+function textOf(texts: string[], size: number, mtimeMs: number): FileText {
+  return { size, mtimeMs, offset: size, entries: texts.map((text) => ({ text, lower: text.toLowerCase() })) }
 }
 
 function toHit(e: Entry, fileId: string, terms: string[]): SearchHit {
@@ -107,6 +111,8 @@ export class SearchIndex {
   private rerun = false
 
   private fileOf(source: SessionSource, v: SessionVersion): string {
+    // A Codex version's `dir` is its rollout file, which grows with the thread.
+    if (source === 'codex') return v.dir
     return source === 'grok' ? grokUpdatesFile(v) : join(PROJECTS_DIR, v.dir, v.id + '.jsonl')
   }
 
@@ -135,8 +141,6 @@ export class SearchIndex {
     const wanted = new Set<string>()
     for (const p of projects) {
       for (const s of p.sessions) {
-        // Codex threads are matched by title only; their content is not shown here.
-        if (p.source === 'codex') continue
         for (const v of s.versions) {
           const file = this.fileOf(p.source, v)
           wanted.add(file)
@@ -144,7 +148,14 @@ export class SearchIndex {
             const st = await fs.stat(file)
             const prev = this.files.get(file)
             if (prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) continue
-            this.files.set(file, p.source === 'grok' ? await readGrokText(file, st.size, st.mtimeMs) : await readFileText(file, prev, st.size, st.mtimeMs))
+            this.files.set(
+              file,
+              p.source === 'grok'
+                ? await readGrokText(file, st.size, st.mtimeMs)
+                : p.source === 'codex'
+                  ? textOf(codexSearchText(v.id), st.size, st.mtimeMs)
+                  : await readFileText(file, prev, st.size, st.mtimeMs),
+            )
           } catch {
             this.files.delete(file)
           }

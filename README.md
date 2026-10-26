@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A Windows desktop app for the local conversation history of three coding agents: [Claude Code](https://code.claude.com) (CC), [Codex](https://openai.com/codex), and [Grok](https://x.ai). It lists conversations by project, shows and searches Claude Code and Grok conversations, manages Claude Code project memories, and deletes conversations together with the data they leave behind.
+A Windows desktop app for the local conversation history of three coding agents: [Claude Code](https://code.claude.com), [Codex](https://openai.com/codex), and [Grok](https://x.ai). It lists conversations by project, shows and searches them, manages Claude Code project memories, and deletes conversations together with the data they leave behind.
 
 It runs entirely on local files. The agents' data is only read, except when you rename or delete something yourself.
 
@@ -12,12 +12,12 @@ It runs entirely on local files. The agents' data is only read, except when you 
 
 The switch at the top of the sidebar selects which history is listed.
 
-| | CC | Codex | Grok |
+| | Claude | Codex | Grok |
 |---|---|---|---|
-| Read from | `~/.claude/projects` | `~/.codex` (thread index, Codex Desktop state) | `~/.grok/sessions` |
+| Read from | `~/.claude/projects` | `~/.codex` (thread index, conversation history, Codex Desktop state) | `~/.grok/sessions` |
 | Grouped by | Start folder | Codex Desktop projects; projectless chats in one group | Working folder |
-| Conversation view | Prompts and replies | Not shown; working folder and subagent count only | Prompts and replies |
-| Search | Titles and content | Titles | Titles and content |
+| Conversation view | Prompts and replies | Prompts and replies | Prompts and replies |
+| Search | Titles and content | Titles and content | Titles and content |
 | Open in terminal | `claude --resume <id>` | — | `grok --resume <id>` |
 | Delete | To the Recycle Bin | Permanently, through Codex; files to the Recycle Bin | Permanently |
 | Project memories | Yes | — | — |
@@ -36,7 +36,7 @@ Copies of one conversation (created when a session is resumed, rewound, or forke
 
 ## Delete Codex conversations
 
-Codex conversations are listed with their titles; their content stays in Codex Desktop. Deleting a conversation or a project removes:
+Codex conversations are grouped by Codex Desktop project, with the titles Codex Desktop shows. They are continued in Codex Desktop, not from here. Deleting a conversation or a project removes:
 
 - **Conversation records**: deleted by Codex itself (`thread/delete` of the Codex app-server bundled with Codex Desktop), including the conversation's subagent threads. This is permanent.
 - **Codex Desktop cache entries**: Codex Desktop keeps per-conversation entries (descriptions, workspace hints, output folders, sidebar order) in `~/.codex/.codex-global-state.json` and does not remove them for every deleted conversation. The app removes the entries of the deleted conversations from that file and from `session_index.jsonl` and `history.jsonl`. Each changed file is backed up first to `codex-backups` in the app's data folder.
@@ -46,15 +46,9 @@ Quit Codex Desktop completely before deleting: it keeps its state in memory and 
 
 ## Grok conversations
 
-Grok conversations are shown like Claude Code ones. Grok's own subagents are listed in the right panel and can be opened.
+Grok's own subagents are listed in the right panel and can be opened.
 
-Conversations dispatched through [grok-subagent-mcp](https://github.com/cigenb/grok-subagent-mcp) are labeled `Claude` or `Codex`. The right panel links a Grok session to the Claude Code conversation that dispatched it, and a Claude Code conversation to the Grok sessions it dispatched. For dispatched tasks, only the task and its scope are shown, not the fixed instructions the server adds.
-
-Deleting a Grok conversation is permanent and does not use the Recycle Bin:
-
-- Sessions registered by grok-subagent-mcp are deleted by its own cleanup (native sessions, task records, logs). It refuses tasks that are running, whose result has not been collected, or that are marked to keep.
-- Other sessions are deleted with `grok sessions delete`, together with the sessions of their subagents. `grok sessions delete` may also remove history stored remotely.
-- Sessions open in Grok cannot be deleted or resumed.
+Deleting a Grok conversation is permanent: it runs `grok sessions delete` for the session and the sessions of its subagents, which may also remove history stored remotely. Subagent session folders the Grok CLI leaves behind go to the Recycle Bin. Sessions open in Grok cannot be deleted or resumed.
 
 ## Manage Claude Code project memories
 
@@ -72,14 +66,14 @@ Claude Code keeps per-project memories as Markdown files in `~/.claude/projects/
 
 Conversations refresh as the agents write them, and Claude Code conversations that are open are marked. You can keep a small terminal window for typing and read the conversation here:
 
-- Only prompts and replies are shown, with Markdown rendered. Commentary written between tool calls is folded; tool calls, tool output, and thinking are left out. When the agent continues on its own (for example after a subagent reports back), each reply stays separate.
+- Only prompts and replies are shown, with Markdown rendered. Codex attachments are shown as images when the pasted file still exists. Commentary written between tool calls is folded; tool calls, tool output, and thinking are left out. When the agent continues on its own (for example after a subagent reports back), each reply stays separate.
 - **Markdown edits** made by Claude Code appear as diff cards. **Preview** opens the file's current content in the right panel with the changed lines highlighted.
 - **Subagents and MCP calls** are listed in the right panel with their status. Click a subagent to read its own conversation.
 - **Open in terminal** opens a Windows Terminal tab in the project folder: on a conversation it resumes it, on a project it starts a new conversation.
 
 ## Search
 
-One search box covers conversation titles and the text of prompts and replies in the selected history (titles only for Codex). Results open at the matching message with the search terms highlighted.
+One search box covers conversation titles and the text of prompts and replies in the selected history. Results open at the matching message with the search terms highlighted.
 
 ![Search results and a subagent conversation](docs/screenshots/search-subagent.png)
 
@@ -107,12 +101,12 @@ Requirements: Windows 10 or 11. Each history appears when its folder exists: `%U
 
 - English and Simplified Chinese UI; light and dark themes follow Windows.
 - Shortcuts: `Ctrl+K` search, `Ctrl+F` find in the open conversation, `Ctrl+B` toggle the sidebar, `Ctrl+=` / `Ctrl+-` / `Ctrl+0` zoom.
-- Claude Code and Grok conversations can be exported as Markdown.
+- Conversations can be exported as Markdown.
 
 ## Limitations
 
 - Windows only.
-- Codex Desktop's state file and Grok's session files have no published format; a new Codex or Grok version can change them.
+- Codex's databases, Codex Desktop's state file and Grok's session files have no published format; a new Codex or Grok version can change them.
 - Subagent transcripts that Claude Code has already cleaned up cannot be opened; the subagent is still listed.
 - For MCP tools, only whether a call returned is shown, not what the tool did.
 - Only Markdown edits made with Claude Code's `Edit`, `MultiEdit`, or `Write` are shown; changes made through shell commands are not captured.

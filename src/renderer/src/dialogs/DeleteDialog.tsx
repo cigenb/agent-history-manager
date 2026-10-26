@@ -45,7 +45,6 @@ export default function DeleteDialog({
     { kind: 'history', label: t.kindHistory },
     { kind: 'temp', label: t.kindTemp },
     { kind: 'memory', label: t.kindMemory },
-    { kind: 'mcp', label: t.kindMcp },
     { kind: 'output', label: t.kindOutput },
   ]
   const [plan, setPlan] = useState<DeletePlan | null>(null)

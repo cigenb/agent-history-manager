@@ -52,7 +52,7 @@ function LiveDot({ state }: { state: LiveState }) {
 }
 
 const SOURCES = [
-  ['claude', 'CC'],
+  ['claude', 'Claude'],
   ['codex', 'Codex'],
   ['grok', 'Grok'],
 ] as const
@@ -191,9 +191,9 @@ export default function Sidebar(props: Props) {
       x: e.clientX,
       y: e.clientY,
       items: [
-        // Codex content is not read, so there is nothing to export or resume here.
-        ...(p.source !== 'codex' ? [{ label: t.exportMarkdown, onSelect: () => void latest.current.props.onExportSession(p.key, s) }] : []),
+        { label: t.exportMarkdown, onSelect: () => void latest.current.props.onExportSession(p.key, s) },
         ...(!isLive ? [
+          // Codex conversations are continued in Codex Desktop.
           ...(p.source !== 'codex' ? [{ label: t.openTerminal, onSelect: () => latest.current.props.onOpenInTerminal(p.key, s.id) }] : []),
           // Grok titles are set inside Grok (/rename).
           ...(p.source === 'claude' ? [{ label: t.rename, onSelect: () => setEditing(`s:${p.key}:${s.id}`) }] : []),
@@ -513,11 +513,7 @@ const SessionRow = memo(function SessionRow({
         <span className="session-title">{pending ?? (s.title || t.untitled)}</span>
       )}
       {s.archived && <span className="origin-badge">{t.archived}</span>}
-      {s.origin && (
-        <span className="origin-badge" title={s.origin.client === 'claude' ? t.originBadgeClaude : t.originBadgeCodex}>
-          {s.origin.client === 'claude' ? 'Claude' : 'Codex'}
-        </span>
-      )}
+
     </div>
   )
 })

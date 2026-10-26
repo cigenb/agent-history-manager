@@ -282,7 +282,7 @@ body.resizing .resizer {
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 12.5px;
+  font-size: 12px;
   cursor: pointer;
 }
 .source-switch button[aria-pressed='true'] {
@@ -550,27 +550,6 @@ body.resizing .resizer {
   background: var(--active);
   color: var(--text);
 }
-.codex-facts {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 24px 0;
-}
-.codex-facts dl {
-  margin: 0;
-  font-size: 13px;
-  color: var(--muted);
-}
-.codex-facts dt {
-  font-weight: 500;
-  margin-bottom: 2px;
-}
-.codex-facts dd {
-  margin: 0 0 4px;
-  color: var(--text-2);
-  overflow-wrap: anywhere;
-}
-
 .origin-badge {
   flex: none;
   padding: 0 5px;

@@ -62,7 +62,6 @@ export function translateError(t: Dictionary, error: ActionError | undefined, fa
     case 'restore-failed': return t.errorRestore(error.detail, error.path)
     case 'export-failed': return t.exportFailed
     case 'grok-session-open': return t.errorGrokOpen
-    case 'grok-mcp-missing': return t.errorGrokMcpMissing
     case 'grok-failed': return t.errorGrok(error.detail)
     case 'codex-running': return t.errorCodexRunning
     case 'codex-failed': return t.errorCodex(error.detail)

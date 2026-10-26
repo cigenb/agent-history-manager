@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-在 Windows 上管理三种编程助手本机对话记录的桌面程序：[Claude Code](https://code.claude.com)（CC）、[Codex](https://openai.com/codex) 和 [Grok](https://x.ai)。按项目列出对话，查看和搜索 Claude Code 与 Grok 的对话，管理 Claude Code 项目记忆，删除对话时连同它留下的数据一起清理。
+在 Windows 上管理三种编程助手本机对话记录的桌面程序：[Claude Code](https://code.claude.com)、[Codex](https://openai.com/codex) 和 [Grok](https://x.ai)。按项目列出对话，查看和搜索对话内容，管理 Claude Code 项目记忆，删除对话时连同它留下的数据一起清理。
 
 程序只处理本机文件。除非你主动重命名或删除，它只读取这些助手的数据，不做修改。
 
@@ -12,12 +12,12 @@
 
 侧栏顶部的切换按钮决定列出哪一种记录。
 
-| | CC | Codex | Grok |
+| | Claude | Codex | Grok |
 |---|---|---|---|
-| 读取位置 | `~/.claude/projects` | `~/.codex`（线程索引、Codex Desktop 状态） | `~/.grok/sessions` |
+| 读取位置 | `~/.claude/projects` | `~/.codex`（线程索引、对话历史、Codex Desktop 状态） | `~/.grok/sessions` |
 | 分组 | 启动目录 | Codex Desktop 的项目；无项目对话归为一组 | 工作目录 |
-| 查看对话 | 提问和回答 | 不显示内容，只显示工作目录和子代理数 | 提问和回答 |
-| 搜索 | 标题和正文 | 标题 | 标题和正文 |
+| 查看对话 | 提问和回答 | 提问和回答 | 提问和回答 |
+| 搜索 | 标题和正文 | 标题和正文 | 标题和正文 |
 | 在终端中打开 | `claude --resume <id>` | — | `grok --resume <id>` |
 | 删除 | 移到回收站 | 由 Codex 永久删除，相关文件移到回收站 | 永久删除 |
 | 项目记忆 | 有 | — | — |
@@ -36,7 +36,7 @@
 
 ## 删除 Codex 对话
 
-Codex 对话只列出标题，内容留在 Codex Desktop 里看。删除对话或项目时会清理：
+Codex 对话按 Codex Desktop 的项目分组，标题和 Codex Desktop 里显示的一致。接着聊要回到 Codex Desktop。删除对话或项目时会清理：
 
 - **对话记录**：由 Codex 自己删除（Codex Desktop 自带的 app-server 的 `thread/delete`），对话的子代理线程一起删除。删除是永久的。
 - **Codex Desktop 缓存条目**：Codex Desktop 在 `~/.codex/.codex-global-state.json` 里按对话保存描述、工作区、输出目录、侧栏顺序等条目，删除对话后不一定清掉。程序会从这个文件以及 `session_index.jsonl`、`history.jsonl` 里去掉被删对话的条目，改动前先把原文件备份到程序数据目录的 `codex-backups`。
@@ -46,15 +46,9 @@ Codex 对话只列出标题，内容留在 Codex Desktop 里看。删除对话�
 
 ## Grok 对话
 
-Grok 对话的显示方式和 Claude Code 相同，Grok 自己的子代理列在右侧栏，可以点开查看。
+Grok 自己的子代理列在右侧栏，可以点开查看。
 
-通过 [grok-subagent-mcp](https://github.com/cigenb/grok-subagent-mcp) 派发的对话带 `Claude` 或 `Codex` 标签。右侧栏可以从 Grok 会话跳到派发它的 Claude Code 对话，也可以从 Claude Code 对话跳到它派发的 Grok 会话。派发的任务只显示任务和边界两部分，不显示服务附加的固定指令。
-
-删除 Grok 对话是永久的，不经过回收站：
-
-- grok-subagent-mcp 登记的会话交给它自己的清理功能删除（原生会话、任务记录、日志）。运行中、结果未领取或标记保留的任务会被拒绝。
-- 其他会话用 `grok sessions delete` 删除，连同其子代理的会话。`grok sessions delete` 也可能删除远端保存的历史。
-- 正在 Grok 中打开的会话不能删除，也不能续聊。
+删除 Grok 对话是永久的：对会话及其子代理的会话执行 `grok sessions delete`，这个命令也可能删除远端保存的历史。Grok CLI 留下的子代理会话目录移到回收站。正在 Grok 中打开的会话不能删除，也不能续聊。
 
 ## 管理 Claude Code 项目记忆
 
@@ -72,14 +66,14 @@ Claude Code 把每个项目的记忆存成 Markdown 文件，放在 `~/.claude/p
 
 对话随助手的写入实时刷新，正在 Claude Code 里打开的对话会有标记。可以开一个小终端窗口负责输入，在这里看对话：
 
-- 只显示提问和回答，Markdown 正常渲染。工具调用之间的过程说明默认折叠，工具调用、工具输出和思考过程不显示。助手自己接着说时（比如子代理交回报告后），每条回复分开显示。
+- 只显示提问和回答，Markdown 正常渲染。Codex 提问里粘贴的图片，原文件还在时会显示出来。工具调用之间的过程说明默认折叠，工具调用、工具输出和思考过程不显示。助手自己接着说时（比如子代理交回报告后），每条回复分开显示。
 - Claude Code 的 **Markdown 修改**显示为 diff 卡片。点「预览」在右侧栏查看文件当前内容，并标出改动的行。
 - **子代理和 MCP 调用**列在右侧栏，带状态。点子代理可以查看它自己的对话。
 - **在终端中打开**：在项目目录新开一个 Windows Terminal 标签。对会话是接着聊，对项目是开始新对话。
 
 ## 搜索
 
-一个搜索框同时搜当前来源的会话标题和提问、回答的正文（Codex 只搜标题）。打开结果会跳到命中的那条消息，并高亮关键词。
+一个搜索框同时搜当前来源的会话标题和提问、回答的正文。打开结果会跳到命中的那条消息，并高亮关键词。
 
 ![搜索结果和子代理对话](docs/screenshots/search-subagent.png)
 
@@ -107,12 +101,12 @@ Claude Code 把每个项目的记忆存成 Markdown 文件，放在 `~/.claude/p
 
 - 界面支持简体中文和英文，深浅色跟随 Windows。
 - 快捷键：`Ctrl+K` 搜索，`Ctrl+F` 在当前对话中查找，`Ctrl+B` 显示或隐藏侧栏，`Ctrl+=` / `Ctrl+-` / `Ctrl+0` 缩放。
-- Claude Code 和 Grok 对话可以导出为 Markdown。
+- 对话可以导出为 Markdown。
 
 ## 限制
 
 - 只支持 Windows。
-- Codex Desktop 的状态文件和 Grok 的会话文件没有公开格式，Codex 或 Grok 升级后可能变化。
+- Codex 的数据库、Codex Desktop 的状态文件和 Grok 的会话文件没有公开格式，Codex 或 Grok 升级后可能变化。
 - Claude Code 已经清理掉的子代理记录无法打开，子代理本身仍会列出。
 - MCP 工具只显示调用是否返回，不显示工具内部做了什么。
 - 只显示 Claude Code 用 `Edit`、`MultiEdit`、`Write` 对 Markdown 文件做的修改；通过 shell 命令改的文件抓不到。

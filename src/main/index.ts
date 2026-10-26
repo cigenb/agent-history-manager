@@ -11,13 +11,11 @@ import type {
   LiveSessions,
   ProjectSummary,
   SaveMarkdownResult,
-  SessionDetail,
-  SessionLink,
   SessionSource,
   UiState,
 } from '../shared/types'
-import { CODEX_HOME, isCodexKey, loadCodexSession, scanCodex } from './codex'
-import { GROK_SESSIONS_DIR, GrokIndex, isGrokKey, loadGrokAgent, loadGrokSession, readMcpTasks, type McpTask } from './grok'
+import { CODEX_HOME, isCodexKey, loadCodexAgent, loadCodexSession, scanCodex } from './codex'
+import { GROK_SESSIONS_DIR, GrokIndex, isGrokKey, loadGrokAgent, loadGrokSession } from './grok'
 import { LIVE_SESSIONS_DIR, liveSessionIds, liveSessions, openInTerminal, openProjectInTerminal, planDelete, renameSession, runDelete } from './manage'
 import { getProjectMemory, listMemoryBackups, planMemoryDelete, restoreMemoryBackup, runMemoryDelete } from './memory'
 import { SearchIndex } from './search'
@@ -65,7 +63,6 @@ let index: SessionIndex
 let grokIndex: GrokIndex
 const searchIndex = new SearchIndex()
 let lastProjects: ProjectSummary[] = []
-let lastTasks: McpTask[] = []
 let watcher: FSWatcher | null = null
 let grokWatcher: FSWatcher | null = null
 let codexWatcher: FSWatcher | null = null
@@ -74,29 +71,6 @@ let liveInterval: NodeJS.Timeout | null = null
 
 function projectByKey(key: string): ProjectSummary | undefined {
   return lastProjects.find((p) => p.key === key)
-}
-
-/** The listed conversation that has a version with this id, in the given history. */
-function linkTo(source: SessionSource, id: string): SessionLink | null {
-  for (const p of lastProjects) {
-    if (p.source !== source) continue
-    const s = p.sessions.find((x) => x.versions.some((v) => v.id === id))
-    if (s) return { projectKey: p.key, id: s.id, title: s.title }
-  }
-  return null
-}
-
-/** Grok-MCP links both ways: a Grok session to the Claude Code session that dispatched it, and back. */
-function addLinks(detail: SessionDetail): SessionDetail {
-  if (detail.source === 'grok') {
-    const owner = detail.origin?.client === 'claude' ? linkTo('claude', detail.origin.owner) : null
-    return owner ? { ...detail, originSession: owner } : detail
-  }
-  const ids = new Set(detail.versions.map((v) => v.id))
-  const dispatched = [...new Set(lastTasks.filter((t) => t.client === 'claude' && ids.has(t.owner)).map((t) => t.sessionId))]
-    .map((id) => linkTo('grok', id))
-    .filter((l): l is SessionLink => !!l)
-  return dispatched.length ? { ...detail, dispatched } : detail
 }
 
 function boundsVisible(b: { x?: number; y?: number; width: number; height: number }): boolean {
@@ -227,9 +201,9 @@ function startWatching(): void {
   }
   let codexTimer: NodeJS.Timeout | null = null
   try {
-    // The thread index and Desktop's state file; Codex's log database in the same folder changes constantly.
+    // Thread index, history projection and Desktop's state file; Codex's log database here changes constantly.
     codexWatcher = watch(CODEX_HOME, (_event, filename) => {
-      if (filename && !/^(state_\d+\.sqlite(-wal)?|\.codex-global-state\.json)$/.test(String(filename))) return
+      if (filename && !/^((state|thread_history)_\d+\.sqlite(-wal)?|\.codex-global-state\.json|session_index\.jsonl)$/.test(String(filename))) return
       if (codexTimer) clearTimeout(codexTimer)
       codexTimer = setTimeout(() => {
         codexTimer = null
@@ -287,10 +261,8 @@ const deletedNote = () => DELETED_NOTES[store.getUi(app.getLocale()).language ??
 
 function registerIpc(): void {
   ipcMain.handle('projects:list', async () => {
-    const tasks = readMcpTasks()
-    const [claude, codex, grok] = await Promise.all([index.scan(), scanCodex(), grokIndex.scan(tasks)])
+    const [claude, codex, grok] = await Promise.all([index.scan(), scanCodex(), grokIndex.scan()])
     lastProjects = [...claude, ...codex, ...grok]
-    lastTasks = tasks
     void searchIndex.update(lastProjects)
     return lastProjects
   })
@@ -298,14 +270,13 @@ function registerIpc(): void {
     const hit = findSession(lastProjects, projectKey, id)
     if (!hit) return null
     if (isCodexKey(projectKey)) return loadCodexSession(hit.project, hit.family)
-    const detail = isGrokKey(projectKey)
-      ? await loadGrokSession(hit.project, hit.family, hit.version)
-      : await loadSession(hit.project, hit.family, hit.version)
-    return detail && addLinks(detail)
+    if (isGrokKey(projectKey)) return loadGrokSession(hit.project, hit.family, hit.version)
+    return loadSession(hit.project, hit.family, hit.version)
   })
   ipcMain.handle('session:loadAgent', async (_e, projectKey: string, fileId: string, agentId: string) => {
     const hit = findSession(lastProjects, projectKey, fileId)
-    if (!hit || isCodexKey(projectKey)) return null
+    if (!hit) return null
+    if (isCodexKey(projectKey)) return loadCodexAgent(hit.version.id, agentId)
     return isGrokKey(projectKey) ? loadGrokAgent(hit.version, agentId) : loadAgent(hit.version, agentId)
   })
   ipcMain.handle('sessions:search', (_e, query: string, temp: boolean, source: SessionSource) =>

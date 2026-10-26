@@ -1,5 +1,8 @@
 import type { SessionDetail } from '../../../shared/types'
 
+/** Product name for the front matter, and the speaker heading of answers */
+const NAMES = { claude: ['Claude Code', 'Claude'], codex: ['Codex', 'Codex'], grok: ['Grok', 'Grok'] } as const
+
 const cleanPrompt = (text: string): string => text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
 
 export function markdownFileName(title: string): string {
@@ -10,6 +13,7 @@ export function markdownFileName(title: string): string {
 }
 
 export function exportMarkdown(detail: SessionDetail, title: string, now = new Date()): string {
+  const [product, speaker] = NAMES[detail.source ?? 'claude']
   const firstPrompt = detail.turns.find((turn) => turn.kind === 'user' && turn.time)
   const date = new Date(firstPrompt?.time || detail.firstTime || now.getTime())
   const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
@@ -20,7 +24,7 @@ export function exportMarkdown(detail: SessionDetail, title: string, now = new D
     `exported: ${now.toISOString()}`,
     `project: ${JSON.stringify(detail.path)}`,
     `session: ${JSON.stringify(detail.id)}`,
-    `source: ${detail.source === 'grok' ? 'Grok' : 'Claude Code'}`,
+    `source: ${product}`,
     '---',
     '',
     `# ${title.replace(/[\r\n]+/g, ' ')}`,
@@ -31,7 +35,7 @@ export function exportMarkdown(detail: SessionDetail, title: string, now = new D
       const body = [...turn.images.map(() => '*[Image]*'), cleanPrompt(turn.text)].filter(Boolean).join('\n\n')
       if (body) messages.push(`### **Human**\n\n${body}`)
     } else if (turn.kind === 'assistant' && turn.text.trim()) {
-      messages.push(`### **${detail.source === 'grok' ? 'Grok' : 'Claude'}**\n\n${turn.text}`)
+      messages.push(`### **${speaker}**\n\n${turn.text}`)
     }
   }
   return [header.join('\n'), ...messages].join('\n\n---\n\n') + '\n'

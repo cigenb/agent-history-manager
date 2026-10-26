@@ -1,6 +1,6 @@
 import { LANGUAGE_LABELS, useT, translateError, useLanguage } from './i18n'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { DeleteKind, DeleteTarget, DocEdit, LiveSessions, ProjectSummary, SearchHit, SessionDetail, SessionLink, SessionSummary, UiState } from '../../shared/types'
+import type { DeleteKind, DeleteTarget, DocEdit, LiveSessions, ProjectSummary, SearchHit, SessionDetail, SessionSummary, UiState } from '../../shared/types'
 import ChatView, { type SearchFocus } from './components/ChatView'
 import DeleteDialog, { type DeleteRequest } from './dialogs/DeleteDialog'
 import { Download, PanelLeft, PanelRight } from './components/Icons'
@@ -203,19 +203,6 @@ export default function App() {
     void window.api.setUiState(patch)
   }, [])
 
-  /** Opens a conversation from another history (Grok-MCP links), switching the sidebar and expanding its project. */
-  const openLink = useCallback(
-    (link: SessionLink) => {
-      const source = projects?.find((p) => p.key === link.projectKey)?.source
-      if (ui && source) {
-        const expanded = ui.expanded.includes(link.projectKey) ? ui.expanded : [...ui.expanded, link.projectKey]
-        updateUi({ source, expanded })
-      }
-      select({ projectKey: link.projectKey, id: link.id })
-    },
-    [projects, ui, updateUi, select],
-  )
-
   const [live, setLive] = useState<LiveSessions>({})
   useEffect(() => {
     void window.api.getLiveSessions().then(setLive)
@@ -363,7 +350,7 @@ export default function App() {
         </div>
         <div className="titlebar-main">
           {selected && <span className="titlebar-title">{currentTitle || t.untitled}</span>}
-          {detail && selected && detail.familyId === selected.id && detail.source !== 'codex' && (
+          {detail && selected && detail.familyId === selected.id && (
             <div className="titlebar-actions">
               <CopyButton getText={() => detail.id} label={t.copySessionId} iconRight />
               <button
@@ -448,7 +435,6 @@ export default function App() {
               view={panelView}
               onView={setPanelView}
               onPreviewDoc={previewDoc}
-              onOpenSession={openLink}
             />
           </>
         )}

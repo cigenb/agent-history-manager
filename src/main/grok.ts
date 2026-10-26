@@ -1,11 +1,9 @@
 import { existsSync, promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import type {
   AgentDetail,
   AgentRun,
-  GrokOrigin,
   ImageData,
   ProjectSummary,
   SessionDetail,
@@ -20,8 +18,6 @@ type UserTurn = Extract<Turn, { kind: 'user' }>
 
 export const GROK_HOME = process.env.GROK_HOME || join(homedir(), '.grok')
 export const GROK_SESSIONS_DIR = join(GROK_HOME, 'sessions')
-/** Grok-MCP's data root: a task registry per client, and `install.json` pointing at its manage.py */
-export const GROK_MCP_DIR = join(GROK_HOME, 'cigenb-grok-mcp')
 
 const KEY_PREFIX = 'grok:'
 export const isGrokKey = (key: string): boolean => key.startsWith(KEY_PREFIX)
@@ -34,51 +30,8 @@ export function grokExecutable(): string {
   return existsSync(bundled) ? bundled : 'grok'
 }
 
-// ---- Grok-MCP registry -----------------------------------------------------
-
-const ACTIVE = new Set(['starting', 'running', 'cancelling', 'cleaning'])
-
-export interface McpTask {
-  client: GrokOrigin['client']
-  owner: string
-  sessionId: string
-  active: boolean
-}
-
-/** Tasks registered by Grok-MCP, read-only. A missing or locked database counts as empty. */
-export function readMcpTasks(): McpTask[] {
-  const out: McpTask[] = []
-  for (const client of ['claude', 'codex'] as const) {
-    let db: DatabaseSync | null = null
-    try {
-      db = new DatabaseSync(join(GROK_MCP_DIR, client, 'tasks.sqlite3'), { readOnly: true })
-      const rows = db.prepare('SELECT owner, session_id, status FROM tasks WHERE session_id IS NOT NULL').all() as {
-        owner: string
-        session_id: string
-        status: string
-      }[]
-      for (const r of rows) out.push({ client, owner: r.owner, sessionId: r.session_id, active: ACTIVE.has(r.status) })
-    } catch {
-      /* Grok-MCP not installed for this client, or the database is busy */
-    } finally {
-      db?.close()
-    }
-  }
-  return out
-}
-
-/**
- * Grok-MCP sends each task as "Task:\n<prompt>\n\nScope and acceptance criteria:\n<scope>\n\nWorking directory: …"
- * followed by fixed instructions; only the task and its scope are worth showing.
- */
-function stripMcpEnvelope(text: string): string {
-  if (!text.startsWith('Task:\n') || !text.includes('\n\nScope and acceptance criteria:\n')) return text
-  const end = text.indexOf('\n\nWorking directory: ')
-  return end === -1 ? text : text.slice(0, end)
-}
-
 const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
-const cleanPrompt = (text: string): string => stripMcpEnvelope(text.replace(SYSTEM_REMINDER, '').trim()).trim()
+const cleanPrompt = (text: string): string => text.replace(SYSTEM_REMINDER, '').trim()
 
 // ---- records ---------------------------------------------------------------
 
@@ -177,7 +130,6 @@ export class GrokIndex {
   private loaded = false
   private running: Promise<ProjectSummary[]> | null = null
   private rerun = false
-  private tasks: McpTask[] = []
   private cachePath: string
 
   constructor(cachePath: string) {
@@ -185,8 +137,7 @@ export class GrokIndex {
   }
 
   /** Coalesces concurrent calls like SessionIndex.scan. */
-  scan(tasks: McpTask[]): Promise<ProjectSummary[]> {
-    this.tasks = tasks
+  scan(): Promise<ProjectSummary[]> {
     if (this.running) {
       this.rerun = true
       return this.running
@@ -214,7 +165,6 @@ export class GrokIndex {
         /* first run */
       }
     }
-    const origins = new Map(this.tasks.map((t) => [t.sessionId, { client: t.client, owner: t.owner }]))
     const nextFiles: Record<string, FileIndex> = {}
     let changed = false
     const groups = new Map<string, { path: string; sessions: SessionSummary[] }>()
@@ -261,7 +211,7 @@ export class GrokIndex {
         const path = summary.info?.cwd || decodeFolder(dir)
         const key = KEY_PREFIX + projectKeyOf(path)
         const lastActivity = parseTs(summary.last_active_at || summary.updated_at) || st.mtimeMs
-        const prompt = idx.firstPrompt?.replace(/^Task:\n/, '').split('\n')[0]
+        const prompt = idx.firstPrompt?.split('\n')[0]
         const title = (summary.title || summary.generated_title || summary.session_summary || prompt || '')
           .trim()
           .slice(0, 120)
@@ -274,7 +224,6 @@ export class GrokIndex {
           familyActivity: lastActivity,
           headless: summary.session_kind === 'headless',
           versions: [version],
-          origin: origins.get(id),
         })
       }
     }
@@ -489,7 +438,6 @@ export async function loadGrokSession(
     versions: family.versions,
     path: project.path,
     ...read,
-    origin: family.origin,
   }
 }
 

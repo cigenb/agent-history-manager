@@ -41,9 +41,8 @@ async function session(id, summary, lines) {
   return dir
 }
 
-const envelope = 'Task:\nCheck the build\n\nScope and acceptance criteria:\nRead only\n\nWorking directory: C:\\x\nFixed instructions'
 const parentDir = await session(parent, { generated_title: 'Build check', last_active_at: '2026-01-02T00:00:00Z' }, [
-  user(envelope, 0),
+  user('<system-reminder>injected</system-reminder>Check the build', 0),
   agent('Let me '),
   agent('check.'),
   record({ sessionUpdate: 'tool_call', toolCallId: 'a' }),
@@ -74,7 +73,7 @@ test('builds prompts, final answers, steps, resumes and subagents from chunked u
   const agents = await readGrokAgents(parentDir)
   const { turns } = await readGrokTurns(join(parentDir, 'updates.jsonl'), agents)
   assert.deepEqual(turns.map((t) => t.kind), ['user', 'assistant', 'resume', 'assistant', 'user', 'assistant'])
-  assert.equal(turns[0].text, 'Task:\nCheck the build\n\nScope and acceptance criteria:\nRead only')
+  assert.equal(turns[0].text, 'Check the build')
   assert.equal(turns[1].text, 'Final answer')
   assert.deepEqual(turns[1].steps, ['Let me check.'])
   assert.deepEqual(turns[1].agents, [{ id: child, description: 'Read file', type: 'general-purpose', model: 'grok-4.7', state: 'done', toolCalls: 2 }])
@@ -86,18 +85,16 @@ test('builds prompts, final answers, steps, resumes and subagents from chunked u
 
 test('lists top-level sessions by working directory and hides child and empty sessions', async () => {
   const index = new GrokIndex(join(home, 'cache.json'))
-  const tasks = [{ client: 'claude', owner: 'claude-session', sessionId: parent, active: false }]
-  const [project] = await index.scan(tasks)
+  const [project] = await index.scan()
   assert.equal(project.source, 'grok')
   assert.equal(project.key, 'grok:c:\\example\\project')
   const byId = Object.fromEntries(project.sessions.map((s) => [s.id, s]))
   assert.deepEqual(Object.keys(byId).sort(), ['headless-session', parent])
   assert.equal(byId[parent].title, 'Build check')
   assert.equal(byId[parent].promptCount, 2)
-  assert.deepEqual(byId[parent].origin, { client: 'claude', owner: 'claude-session' })
   assert.equal(byId['headless-session'].headless, true)
   // Unchanged files come from the cache on the next scan.
-  const again = await new GrokIndex(join(home, 'cache.json')).scan([])
+  const again = await new GrokIndex(join(home, 'cache.json')).scan()
   assert.equal(again[0].sessions.find((s) => s.id === parent).promptCount, 2)
 })
 

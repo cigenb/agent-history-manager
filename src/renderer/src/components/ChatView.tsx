@@ -351,19 +351,7 @@ export default memo(function ChatView({ detail, loading, hasSelection, focus, on
           </div>
         </header>
         <div className="turns" ref={turnsRef}>
-          {detail.codex ? (
-            <div className="codex-facts">
-              <div className="empty-hint">{t.codexHint}</div>
-              <dl>
-                <dt>{t.codexCwd}</dt>
-                <dd>{detail.codex.cwd}</dd>
-                {detail.codex.subagents > 0 && <dd>{t.codexSubagents(detail.codex.subagents)}</dd>}
-                {detail.codex.archived && <dd>{t.archived}</dd>}
-              </dl>
-            </div>
-          ) : (
-            detail.turns.length === 0 && <div className="empty-hint">{t.noTurns}</div>
-          )}
+          {detail.turns.length === 0 && <div className="empty-hint">{t.noTurns}</div>}
           <TurnList
             key={detail.id}
             turns={detail.turns}

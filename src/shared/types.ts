@@ -1,19 +1,6 @@
 /** Claude Code conversations live in ~/.claude/projects, Codex threads in ~/.codex, Grok conversations in ~/.grok/sessions. */
 export type SessionSource = 'claude' | 'codex' | 'grok'
 
-/** A Grok session dispatched through Grok-MCP: the Claude Code session or Codex thread that started it. */
-export interface GrokOrigin {
-  client: 'claude' | 'codex'
-  owner: string
-}
-
-/** Link target for a conversation shown elsewhere in the list. */
-export interface SessionLink {
-  projectKey: string
-  id: string
-  title: string
-}
-
 /** One session file. */
 export interface SessionVersion {
   id: string
@@ -37,8 +24,6 @@ export interface SessionSummary extends SessionVersion {
   /** Started by `claude -p` / `grok -p` (scripts, hooks, tests) rather than by a person */
   headless: boolean
   versions: SessionVersion[]
-  /** Grok sessions only: set when Grok-MCP registered the session */
-  origin?: GrokOrigin
   /** Codex threads archived in Codex Desktop */
   archived?: boolean
 }
@@ -142,13 +127,6 @@ export interface SessionDetail {
   turns: Turn[]
   firstTime: number
   lastTime: number
-  /** Grok sessions dispatched through Grok-MCP: who started it, and the Claude Code session when it is listed */
-  origin?: GrokOrigin
-  originSession?: SessionLink
-  /** Claude Code sessions: Grok sessions this conversation dispatched through Grok-MCP */
-  dispatched?: SessionLink[]
-  /** Codex threads: their content is not shown, only these facts */
-  codex?: { cwd: string; archived: boolean; subagents: number }
 }
 
 export type Language = 'zh' | 'en'
@@ -166,7 +144,7 @@ export interface UiState {
 }
 
 /** What a deletable path is; the delete dialog lets the user pick which kinds to remove. */
-export type DeleteKind = 'sessions' | 'artifacts' | 'history' | 'temp' | 'memory' | 'mcp' | 'output'
+export type DeleteKind = 'sessions' | 'artifacts' | 'history' | 'temp' | 'memory' | 'output'
 
 export type DeleteTarget =
   | { kind: 'session'; projectKey: string; id: string }
@@ -184,7 +162,7 @@ export interface DeletePlan {
   /** Set when deletion must not proceed, e.g. a session is still open in Claude Code */
   blocked?: ActionError
   /**
-   * grok: everything is deleted permanently (`grok sessions delete`, Grok-MCP cleanup); kinds cannot be deselected.
+   * grok: everything is deleted permanently with `grok sessions delete`; kinds cannot be deselected.
    * codex: Codex deletes the threads permanently and Desktop's entries for them are removed; files go to the Recycle Bin.
    */
   mode?: 'grok' | 'codex'
@@ -270,7 +248,7 @@ export type ActionError =
   | { code: 'trash-failed' | 'memory-update-failed' | 'backup-changed'; files: string[] }
   | { code: 'directory-missing'; path: string }
   | { code: 'terminal-failed' | 'rename-failed' | 'backup-failed' | 'grok-failed'; detail: string }
-  | { code: 'grok-session-open' | 'grok-mcp-missing' | 'codex-running' }
+  | { code: 'grok-session-open' | 'codex-running' }
   | { code: 'codex-failed'; detail: string }
   | { code: 'restore-failed'; detail: string; path: string }
 
