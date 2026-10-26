@@ -1,13 +1,13 @@
 {
-  "name": "cc-history-manager",
-  "productName": "CC History Manager",
-  "version": "0.1.0",
-  "description": "Browse and manage Claude Code CLI sessions by project",
+  "name": "agent-history-manager",
+  "productName": "Agent History Manager",
+  "version": "0.2.0",
+  "description": "Browse and manage Claude Code, Codex and Grok conversations by project",
   "author": "cigenb",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cigenb/cc-history-manager.git"
+    "url": "https://github.com/cigenb/agent-history-manager.git"
   },
   "private": true,
   "main": "./out/main/index.js",
@@ -20,8 +20,8 @@
     "dist": "electron-vite build && electron-builder --win"
   },
   "build": {
-    "appId": "io.github.cigenb.cc-history-manager",
-    "productName": "CC History Manager",
+    "appId": "io.github.cigenb.agent-history-manager",
+    "productName": "Agent History Manager",
     "directories": {
       "output": "release"
     },
@@ -32,7 +32,7 @@
     "win": {
       "target": "zip",
       "icon": "build/icon.ico",
-      "artifactName": "CC-History-Manager-${version}-win-${arch}.${ext}"
+      "artifactName": "Agent-History-Manager-${version}-win-${arch}.${ext}"
     }
   },
   "devDependencies": {

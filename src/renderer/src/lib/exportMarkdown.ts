@@ -20,7 +20,7 @@ export function exportMarkdown(detail: SessionDetail, title: string, now = new D
     `exported: ${now.toISOString()}`,
     `project: ${JSON.stringify(detail.path)}`,
     `session: ${JSON.stringify(detail.id)}`,
-    'source: Claude Code',
+    `source: ${detail.source === 'grok' ? 'Grok' : 'Claude Code'}`,
     '---',
     '',
     `# ${title.replace(/[\r\n]+/g, ' ')}`,
@@ -31,7 +31,7 @@ export function exportMarkdown(detail: SessionDetail, title: string, now = new D
       const body = [...turn.images.map(() => '*[Image]*'), cleanPrompt(turn.text)].filter(Boolean).join('\n\n')
       if (body) messages.push(`### **Human**\n\n${body}`)
     } else if (turn.kind === 'assistant' && turn.text.trim()) {
-      messages.push(`### **Claude**\n\n${turn.text}`)
+      messages.push(`### **${detail.source === 'grok' ? 'Grok' : 'Claude'}**\n\n${turn.text}`)
     }
   }
   return [header.join('\n'), ...messages].join('\n\n---\n\n') + '\n'

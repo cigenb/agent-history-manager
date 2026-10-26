@@ -1,7 +1,23 @@
+/** Claude Code conversations live in ~/.claude/projects, Codex threads in ~/.codex, Grok conversations in ~/.grok/sessions. */
+export type SessionSource = 'claude' | 'codex' | 'grok'
+
+/** A Grok session dispatched through Grok-MCP: the Claude Code session or Codex thread that started it. */
+export interface GrokOrigin {
+  client: 'claude' | 'codex'
+  owner: string
+}
+
+/** Link target for a conversation shown elsewhere in the list. */
+export interface SessionLink {
+  projectKey: string
+  id: string
+  title: string
+}
+
 /** One session file. */
 export interface SessionVersion {
   id: string
-  /** Folder under ~/.claude/projects holding `<id>.jsonl` */
+  /** Claude: folder under ~/.claude/projects holding `<id>.jsonl`. Grok: folder under ~/.grok/sessions holding `<id>/` */
   dir: string
   title: string
   /** Epoch ms of the last user/assistant record */
@@ -18,17 +34,24 @@ export interface SessionSummary extends SessionVersion {
   projectKey: string
   /** Latest activity across all versions; used for ordering */
   familyActivity: number
-  /** Started by `claude -p` (scripts, hooks, tests) rather than by a person */
+  /** Started by `claude -p` / `grok -p` (scripts, hooks, tests) rather than by a person */
   headless: boolean
   versions: SessionVersion[]
+  /** Grok sessions only: set when Grok-MCP registered the session */
+  origin?: GrokOrigin
+  /** Codex threads archived in Codex Desktop */
+  archived?: boolean
 }
 
 export interface ProjectSummary {
-  /** Lower-cased start directory; sessions from several ~/.claude/projects folders can share it */
+  source: SessionSource
+  /** Lower-cased start directory; sessions from several ~/.claude/projects folders can share it. Grok keys start with `grok:` */
   key: string
   /** Directory the sessions were started in (first record's `cwd`) */
   path: string
   name: string
+  /** Codex Desktop's group of threads started without a project; it has no path */
+  projectless?: boolean
   isTemp: boolean
   lastActivity: number
   /** Memory files in the project's memory folder (MEMORY.md not counted) */
@@ -108,6 +131,7 @@ export interface AgentDetail {
 }
 
 export interface SessionDetail {
+  source: SessionSource
   /** File currently shown */
   id: string
   /** Primary file id of the conversation (SessionSummary.id) */
@@ -118,6 +142,13 @@ export interface SessionDetail {
   turns: Turn[]
   firstTime: number
   lastTime: number
+  /** Grok sessions dispatched through Grok-MCP: who started it, and the Claude Code session when it is listed */
+  origin?: GrokOrigin
+  originSession?: SessionLink
+  /** Claude Code sessions: Grok sessions this conversation dispatched through Grok-MCP */
+  dispatched?: SessionLink[]
+  /** Codex threads: their content is not shown, only these facts */
+  codex?: { cwd: string; archived: boolean; subagents: number }
 }
 
 export type Language = 'zh' | 'en'
@@ -130,10 +161,12 @@ export interface UiState {
   showTemp: boolean
   /** Viewer-only conversation order per project key. Entries are any version id of a conversation. */
   sessionOrder: Record<string, string[]>
+  /** Which history the sidebar lists */
+  source: SessionSource
 }
 
 /** What a deletable path is; the delete dialog lets the user pick which kinds to remove. */
-export type DeleteKind = 'sessions' | 'artifacts' | 'history' | 'temp' | 'memory'
+export type DeleteKind = 'sessions' | 'artifacts' | 'history' | 'temp' | 'memory' | 'mcp' | 'output'
 
 export type DeleteTarget =
   | { kind: 'session'; projectKey: string; id: string }
@@ -150,6 +183,11 @@ export interface DeletePlan {
   items: DeleteItem[]
   /** Set when deletion must not proceed, e.g. a session is still open in Claude Code */
   blocked?: ActionError
+  /**
+   * grok: everything is deleted permanently (`grok sessions delete`, Grok-MCP cleanup); kinds cannot be deselected.
+   * codex: Codex deletes the threads permanently and Desktop's entries for them are removed; files go to the Recycle Bin.
+   */
+  mode?: 'grok' | 'codex'
 }
 
 /** One memory file from a project's `memory/` folder. */
@@ -231,7 +269,9 @@ export type ActionError =
   | { code: 'session-open' | 'session-missing' | 'project-missing' | 'name-empty' | 'memory-missing' | 'backup-missing' | 'export-failed' }
   | { code: 'trash-failed' | 'memory-update-failed' | 'backup-changed'; files: string[] }
   | { code: 'directory-missing'; path: string }
-  | { code: 'terminal-failed' | 'rename-failed' | 'backup-failed'; detail: string }
+  | { code: 'terminal-failed' | 'rename-failed' | 'backup-failed' | 'grok-failed'; detail: string }
+  | { code: 'grok-session-open' | 'grok-mcp-missing' | 'codex-running' }
+  | { code: 'codex-failed'; detail: string }
   | { code: 'restore-failed'; detail: string; path: string }
 
 export interface ActionResult {
@@ -304,6 +344,8 @@ export interface Api {
   restoreMemoryBackup(projectKey: string, id: string, overwrite: string[]): Promise<ActionResult>
   /** New Windows Terminal tab in the project directory running `claude --resume` */
   openInTerminal(projectKey: string, id: string): Promise<ActionResult>
+  /** New Windows Terminal tab in the project directory starting a new `claude` conversation */
+  openProjectInTerminal(projectKey: string): Promise<ActionResult>
   planDelete(target: DeleteTarget): Promise<DeletePlan>
   /** Moves the planned files of the chosen kinds to the Recycle Bin */
   runDelete(target: DeleteTarget, kinds: DeleteKind[]): Promise<ActionResult>
@@ -311,7 +353,7 @@ export interface Api {
    * Conversation titles, prompts and Claude's answer text. Every space-separated term must appear in the title or
    * in one message. `temp` selects temp-folder and scripted conversations, as the sidebar's toggle does.
    */
-  searchSessions(query: string, temp: boolean): Promise<SearchResponse>
+  searchSessions(query: string, temp: boolean, source: SessionSource): Promise<SearchResponse>
   find(text: string, forward: boolean, findNext: boolean): void
   stopFind(): void
   onFindResult(cb: (r: FindResult) => void): () => void

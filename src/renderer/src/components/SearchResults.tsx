@@ -1,7 +1,7 @@
 import { useT } from '../i18n'
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import { searchTerms } from '../../../shared/search'
-import type { ProjectSummary, SearchHit, SearchResponse } from '../../../shared/types'
+import type { ProjectSummary, SearchHit, SearchResponse, SessionSource } from '../../../shared/types'
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -14,18 +14,20 @@ function Highlighted({ text, terms }: { text: string; terms: string[] }) {
 interface Props {
   query: string
   temp: boolean
+  source: SessionSource
   projects: ProjectSummary[]
   selectedId: string | null
   onOpen: (projectKey: string, id: string, hit: SearchHit | undefined, terms: string[]) => void
 }
 
 /** Search results, shown in the sidebar in place of the project list while the search box has text. */
-export default function SearchResults({ query, temp, projects, selectedId, onOpen }: Props) {
+export default function SearchResults({ query, temp, source, projects, selectedId, onOpen }: Props) {
   const t = useT()
   const q = query.trim()
   const [state, setState] = useState<{
     query: string
     temp: boolean
+    source: SessionSource
     response: SearchResponse | null
     failed: boolean
   } | null>(null)
@@ -33,16 +35,16 @@ export default function SearchResults({ query, temp, projects, selectedId, onOpe
   useEffect(() => {
     let active = true
     const timer = setTimeout(() => {
-      window.api.searchSessions(q, temp).then(
-        (response) => { if (active) setState({ query: q, temp, response, failed: false }) },
-        () => { if (active) setState({ query: q, temp, response: null, failed: true }) },
+      window.api.searchSessions(q, temp, source).then(
+        (response) => { if (active) setState({ query: q, temp, source, response, failed: false }) },
+        () => { if (active) setState({ query: q, temp, source, response: null, failed: true }) },
       )
     }, 150)
     return () => {
       active = false
       clearTimeout(timer)
     }
-  }, [q, temp, projects]) // projects: a rescan can bring new matches or move a conversation to a new primary id
+  }, [q, temp, source, projects]) // projects: a rescan can bring new matches or move a conversation to a new primary id
 
   const sessions = useMemo(() => {
     const out = new Map<string, { project: ProjectSummary; title: string }>()
@@ -51,7 +53,7 @@ export default function SearchResults({ query, temp, projects, selectedId, onOpe
   }, [projects])
 
   const terms = useMemo(() => searchTerms(state?.query ?? ''), [state?.query])
-  const pending = state?.query !== q || state.temp !== temp
+  const pending = state?.query !== q || state.temp !== temp || state.source !== source
 
   if (!state?.response) {
     return <div className="sidebar-empty">{state?.failed && !pending ? t.searchFailed : t.searching}</div>
@@ -74,7 +76,7 @@ export default function SearchResults({ query, temp, projects, selectedId, onOpe
               <span className="search-result-title">
                 <Highlighted text={s.title || t.untitled} terms={terms} />
               </span>
-              <span className="search-result-project">{s.project.name}</span>
+              <span className="search-result-project">{s.project.projectless ? t.noProject : s.project.name}</span>
             </span>
             {r.hit && (
               <span className="search-result-snippet">

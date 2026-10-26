@@ -1,7 +1,7 @@
 import { useT } from '../i18n'
 import type { Dictionary } from '../i18n/zh'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { AgentDetail, AgentRun, DocEdit, DocFile, LiveSessions, McpUse, SessionDetail, Turn } from '../../../shared/types'
+import type { AgentDetail, AgentRun, DocEdit, DocFile, LiveSessions, McpUse, SessionDetail, SessionLink, Turn } from '../../../shared/types'
 import { TurnList } from './ChatView'
 import { displayPath, type PreviewDoc } from './DocEditCard'
 import { ChevronLeft, ChevronRight } from './Icons'
@@ -24,6 +24,8 @@ interface Props {
   view: PanelView
   onView: (view: PanelView) => void
   onPreviewDoc: PreviewDoc
+  /** Opens a linked conversation, switching the sidebar to its history */
+  onOpenSession: (link: SessionLink) => void
 }
 
 // Subagent prompts are plain text from the Agent tool's input, so their transcripts carry no images.
@@ -129,6 +131,52 @@ function ActivityLists({
           <div className="rightbar-section">MCP</div>
           {mcp.map((m) => (
             <McpRow key={`${m.server}/${m.tool}`} use={m} live={live} />
+          ))}
+        </section>
+      )}
+    </div>
+  )
+}
+
+function LinkRow({ title, meta, onOpen }: { title: string; meta: string; onOpen?: () => void }) {
+  const t = useT()
+  return (
+    <button className="agent-row" disabled={!onOpen} title={onOpen ? t.openLinked : undefined} onClick={onOpen}>
+      <span className="agent-row-main">
+        <span className="agent-row-title">{title}</span>
+        <span className="agent-row-meta">{meta}</span>
+      </span>
+      {onOpen && <ChevronRight width={14} height={14} className="agent-row-chevron" />}
+    </button>
+  )
+}
+
+/** Grok-MCP links: the conversation that dispatched this Grok session, or the Grok sessions this one dispatched. */
+function SessionLinks({ detail, onOpen }: { detail: SessionDetail; onOpen: (link: SessionLink) => void }) {
+  const t = useT()
+  const { origin, originSession, dispatched } = detail
+  if (!origin && !dispatched?.length) return null
+  return (
+    <div className="activity-lists">
+      {origin && (
+        <section>
+          <div className="rightbar-section">{t.origin}</div>
+          {originSession ? (
+            <LinkRow title={originSession.title || t.untitled} meta="Claude Code" onOpen={() => onOpen(originSession)} />
+          ) : origin.client === 'claude' ? (
+            <LinkRow title="Claude Code" meta={t.originClaudeMissing} />
+          ) : (
+            <LinkRow title={t.originCodex} meta={origin.owner} />
+          )}
+        </section>
+      )}
+      {!!dispatched?.length && (
+        <section>
+          <div className="rightbar-section">
+            {t.dispatchedGrok} <span className="count">{dispatched.length}</span>
+          </div>
+          {dispatched.map((l) => (
+            <LinkRow key={l.id} title={l.title || t.untitled} meta="Grok" onOpen={() => onOpen(l)} />
           ))}
         </section>
       )}
@@ -374,7 +422,7 @@ function DocView({
 }
 
 /** Right panel beside the conversation; its top strip sits under the window controls (see App). */
-export default memo(function RightBar({ detail, live, view, onView, onPreviewDoc }: Props) {
+export default memo(function RightBar({ detail, live, view, onView, onPreviewDoc, onOpenSession }: Props) {
   const t = useT()
   const openAgent = (id: string) => onView({ kind: 'agent', id })
   return (
@@ -389,8 +437,9 @@ export default memo(function RightBar({ detail, live, view, onView, onPreviewDoc
         <>
           <Header title={t.activity} />
           <div className="rightbar-body">
+            <SessionLinks detail={detail} onOpen={onOpenSession} />
             <ActivityLists turns={detail.turns} live={live} onOpenAgent={openAgent} />
-            {!detail.turns.some((x) => x.kind === 'assistant' && (x.agents.length || x.mcp.length)) && (
+            {!detail.origin && !detail.dispatched?.length && !detail.turns.some((x) => x.kind === 'assistant' && (x.agents.length || x.mcp.length)) && (
               <div className="rightbar-empty">{t.noActivity}</div>
             )}
           </div>

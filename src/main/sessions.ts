@@ -317,7 +317,7 @@ function sessionTitle(idx: FileIndex): string {
 }
 
 /** Windows paths are case-insensitive and one directory can map to several ~/.claude/projects folders. */
-function projectKeyOf(path: string): string {
+export function projectKeyOf(path: string): string {
   return path.replace(/[\\/]+$/, '').toLowerCase()
 }
 
@@ -387,7 +387,7 @@ function groupFamilies<T extends { idx: FileIndex; dir: string }>(files: T[]): T
   return [...out.values()]
 }
 
-const TEMP_PATTERNS = [/\\AppData\\Local\\Temp\\/i, /\\AppData\\Roaming\\Claude\\scratch/i]
+export const TEMP_PATTERNS = [/\\AppData\\Local\\Temp\\/i, /\\AppData\\Roaming\\Claude\\scratch/i]
 
 export class SessionIndex {
   private cache: CacheFile = { version: CACHE_VERSION, files: {} }
@@ -511,6 +511,7 @@ export class SessionIndex {
     for (const [key, { path, sessions }] of groups) {
       sessions.sort((a, b) => b.familyActivity - a.familyActivity)
       projects.push({
+        source: 'claude',
         key,
         path,
         name: basename(path) || path,
@@ -870,7 +871,7 @@ function metaByAgentId(ctx: SessionContext, agentId: string): AgentMeta | undefi
   return undefined
 }
 
-const SAFE_SEGMENT = /^[^\\/]+$/
+export const SAFE_SEGMENT = /^[^\\/]+$/
 
 export async function loadSession(
   project: ProjectSummary,
@@ -882,6 +883,7 @@ export async function loadSession(
   const read = await readTurns(join(PROJECTS_DIR, s.dir, s.id + '.jsonl'), ctx, false)
   if (!read) return null
   return {
+    source: 'claude',
     id: s.id,
     familyId: family.id,
     projectKey: project.key,

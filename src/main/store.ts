@@ -17,7 +17,7 @@ interface StoreData {
 }
 
 const DEFAULTS: StoreData = {
-  ui: { projectOrder: [], expanded: [], showTemp: false, sessionOrder: {} },
+  ui: { projectOrder: [], expanded: [], showTemp: false, sessionOrder: {}, source: 'claude' },
 }
 
 /** App-owned state (project order, window size). Lives in userData; never written into ~/.claude. */

@@ -161,7 +161,7 @@ button {
 }
 .sidebar-collapsed .app-name,
 .sidebar-collapsed .sidebar,
-.sidebar-collapsed .resizer {
+.sidebar-collapsed .resizer:not(.right) {
   display: none;
 }
 
@@ -264,6 +264,31 @@ body.resizing .resizer {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+.source-switch {
+  display: flex;
+  margin: 4px 12px 8px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.source-switch button {
+  flex: 1;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.source-switch button[aria-pressed='true'] {
+  background: var(--active);
+  color: var(--text);
+  font-weight: 500;
 }
 
 .search {
@@ -524,6 +549,36 @@ body.resizing .resizer {
 .session-row.active {
   background: var(--active);
   color: var(--text);
+}
+.codex-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px 0;
+}
+.codex-facts dl {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.codex-facts dt {
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+.codex-facts dd {
+  margin: 0 0 4px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.origin-badge {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--muted);
 }
 .session-title {
   flex: 1;

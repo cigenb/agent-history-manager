@@ -45,6 +45,8 @@ export default function DeleteDialog({
     { kind: 'history', label: t.kindHistory },
     { kind: 'temp', label: t.kindTemp },
     { kind: 'memory', label: t.kindMemory },
+    { kind: 'mcp', label: t.kindMcp },
+    { kind: 'output', label: t.kindOutput },
   ]
   const [plan, setPlan] = useState<DeletePlan | null>(null)
   const [chosen, setChosen] = useState<Set<DeleteKind>>(new Set())
@@ -140,6 +142,7 @@ export default function DeleteDialog({
                       <input
                         type="checkbox"
                         checked={on}
+                        disabled={plan.mode === 'grok'}
                         title={on ? t.deselectKind : t.selectKind}
                         onChange={() => toggle(g.kind)}
                         onClick={(e) => e.stopPropagation()}
@@ -163,6 +166,8 @@ export default function DeleteDialog({
             </GraphCanvas>
             {plan.blocked ? (
               <p className="modal-error">{translateError(t, plan.blocked)}</p>
+            ) : plan.mode ? (
+              <p className="mem-del-note">{(plan.mode === 'grok' ? t.grokDeleteNote : t.codexDeleteNote)(formatBytes(total))}</p>
             ) : (
               <p className="mem-del-note">
                 {t.recycleBefore(formatBytes(total))}
@@ -186,7 +191,7 @@ export default function DeleteDialog({
               await onConfirm(request.target, [...chosen])
             }}
           >
-            {busy ? t.deleting : t.moveToRecycleBin}
+            {busy ? t.deleting : plan?.mode ? t.deletePermanently : t.moveToRecycleBin}
           </button>
         </div>
       </div>

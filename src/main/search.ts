@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { searchTerms } from '../shared/search'
-import type { ProjectSummary, SearchHit, SearchResponse, SearchResult } from '../shared/types'
+import type { ProjectSummary, SearchHit, SearchResponse, SearchResult, SessionSource, SessionVersion } from '../shared/types'
+import { grokSearchText, grokUpdatesFile } from './grok'
 import {
   B_ASSISTANT,
   B_SIDECHAIN,
@@ -70,6 +71,12 @@ async function readFileText(file: string, prev: FileText | undefined, size: numb
   return ft
 }
 
+/** Grok logs arrive in chunks that only make sense once assembled, so a changed file is read again in full. */
+async function readGrokText(file: string, size: number, mtimeMs: number): Promise<FileText> {
+  const entries = (await grokSearchText(file)).map((text) => ({ text, lower: text.toLowerCase() }))
+  return { size, mtimeMs, offset: size, entries }
+}
+
 function toHit(e: Entry, fileId: string, terms: string[]): SearchHit {
   let at = -1
   let len = 0
@@ -99,8 +106,8 @@ export class SearchIndex {
   private latest: ProjectSummary[] = []
   private rerun = false
 
-  private fileOf(dir: string, id: string): string {
-    return join(PROJECTS_DIR, dir, id + '.jsonl')
+  private fileOf(source: SessionSource, v: SessionVersion): string {
+    return source === 'grok' ? grokUpdatesFile(v) : join(PROJECTS_DIR, v.dir, v.id + '.jsonl')
   }
 
   /**
@@ -128,14 +135,16 @@ export class SearchIndex {
     const wanted = new Set<string>()
     for (const p of projects) {
       for (const s of p.sessions) {
+        // Codex threads are matched by title only; their content is not shown here.
+        if (p.source === 'codex') continue
         for (const v of s.versions) {
-          const file = this.fileOf(v.dir, v.id)
+          const file = this.fileOf(p.source, v)
           wanted.add(file)
           try {
             const st = await fs.stat(file)
             const prev = this.files.get(file)
             if (prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) continue
-            this.files.set(file, await readFileText(file, prev, st.size, st.mtimeMs))
+            this.files.set(file, p.source === 'grok' ? await readGrokText(file, st.size, st.mtimeMs) : await readFileText(file, prev, st.size, st.mtimeMs))
           } catch {
             this.files.delete(file)
           }
@@ -149,7 +158,7 @@ export class SearchIndex {
    * A conversation matches when every term is in one of its version titles or in one message. Title matches come
    * first. `temp` picks the same side as the sidebar: temp-folder and scripted conversations, or the rest.
    */
-  async search(projects: ProjectSummary[], query: string, temp: boolean): Promise<SearchResponse> {
+  async search(projects: ProjectSummary[], query: string, temp: boolean, source: SessionSource): Promise<SearchResponse> {
     const terms = searchTerms(query)
     if (!terms.length) return { results: [], truncated: false }
     await this.update(projects)
@@ -157,13 +166,14 @@ export class SearchIndex {
     const has = (lower: string) => terms.every((t) => lower.includes(t))
     const found: { result: SearchResult; activity: number }[] = []
     for (const p of projects) {
+      if (p.source !== source) continue
       for (const s of p.sessions) {
         if ((p.isTemp || s.headless) !== temp) continue
         // Primary file first: other versions mostly repeat its history, so they only matter when it has no match.
         const versions = [...s.versions].sort((a, b) => Number(b.id === s.id) - Number(a.id === s.id))
         let hit: SearchHit | undefined
         for (const v of versions) {
-          const e = this.files.get(this.fileOf(v.dir, v.id))?.entries.find((x) => has(x.lower))
+          const e = this.files.get(this.fileOf(p.source, v))?.entries.find((x) => has(x.lower))
           if (e) {
             hit = toHit(e, v.id, terms)
             break

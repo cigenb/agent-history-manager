@@ -4,8 +4,21 @@ import { existsSync, mkdirSync, watch, type FSWatcher } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, extname, join, resolve } from 'node:path'
 import { DELETED_NOTES } from '../shared/types'
-import type { DeleteKind, DeleteTarget, DocFile, LiveSessions, ProjectSummary, SaveMarkdownResult, UiState } from '../shared/types'
-import { LIVE_SESSIONS_DIR, liveSessionIds, liveSessions, openInTerminal, planDelete, renameSession, runDelete } from './manage'
+import type {
+  DeleteKind,
+  DeleteTarget,
+  DocFile,
+  LiveSessions,
+  ProjectSummary,
+  SaveMarkdownResult,
+  SessionDetail,
+  SessionLink,
+  SessionSource,
+  UiState,
+} from '../shared/types'
+import { CODEX_HOME, isCodexKey, loadCodexSession, scanCodex } from './codex'
+import { GROK_SESSIONS_DIR, GrokIndex, isGrokKey, loadGrokAgent, loadGrokSession, readMcpTasks, type McpTask } from './grok'
+import { LIVE_SESSIONS_DIR, liveSessionIds, liveSessions, openInTerminal, openProjectInTerminal, planDelete, renameSession, runDelete } from './manage'
 import { getProjectMemory, listMemoryBackups, planMemoryDelete, restoreMemoryBackup, runMemoryDelete } from './memory'
 import { SearchIndex } from './search'
 import { findSession, loadAgent, loadSession, PROJECTS_DIR, SessionIndex } from './sessions'
@@ -49,14 +62,41 @@ function setZoom(level: number): void {
 let win: BrowserWindow | null = null
 let store: Store
 let index: SessionIndex
+let grokIndex: GrokIndex
 const searchIndex = new SearchIndex()
 let lastProjects: ProjectSummary[] = []
+let lastTasks: McpTask[] = []
 let watcher: FSWatcher | null = null
+let grokWatcher: FSWatcher | null = null
+let codexWatcher: FSWatcher | null = null
 let liveWatcher: FSWatcher | null = null
 let liveInterval: NodeJS.Timeout | null = null
 
 function projectByKey(key: string): ProjectSummary | undefined {
   return lastProjects.find((p) => p.key === key)
+}
+
+/** The listed conversation that has a version with this id, in the given history. */
+function linkTo(source: SessionSource, id: string): SessionLink | null {
+  for (const p of lastProjects) {
+    if (p.source !== source) continue
+    const s = p.sessions.find((x) => x.versions.some((v) => v.id === id))
+    if (s) return { projectKey: p.key, id: s.id, title: s.title }
+  }
+  return null
+}
+
+/** Grok-MCP links both ways: a Grok session to the Claude Code session that dispatched it, and back. */
+function addLinks(detail: SessionDetail): SessionDetail {
+  if (detail.source === 'grok') {
+    const owner = detail.origin?.client === 'claude' ? linkTo('claude', detail.origin.owner) : null
+    return owner ? { ...detail, originSession: owner } : detail
+  }
+  const ids = new Set(detail.versions.map((v) => v.id))
+  const dispatched = [...new Set(lastTasks.filter((t) => t.client === 'claude' && ids.has(t.owner)).map((t) => t.sessionId))]
+    .map((id) => linkTo('grok', id))
+    .filter((l): l is SessionLink => !!l)
+  return dispatched.length ? { ...detail, dispatched } : detail
 }
 
 function boundsVisible(b: { x?: number; y?: number; width: number; height: number }): boolean {
@@ -77,7 +117,7 @@ function createWindow(): void {
     minHeight: 520,
     show: false,
     backgroundColor: t.bg,
-    title: 'CC History Manager',
+    title: 'Agent History Manager',
     icon: join(__dirname, '../../build/icon.png'),
     titleBarStyle: 'hidden',
     titleBarOverlay: { color: OVERLAY_COLOR, symbolColor: t.symbol, height: TITLEBAR_HEIGHT },
@@ -167,6 +207,42 @@ function startWatching(): void {
   } catch {
     /* projects dir missing: nothing to watch */
   }
+  let grokTimer: NodeJS.Timeout | null = null
+  try {
+    // <cwd folder>\<session>\updates.jsonl or summary.json; other files in a session folder change constantly.
+    grokWatcher = watch(GROK_SESSIONS_DIR, { recursive: true }, (_event, filename) => {
+      if (filename && !/^[^\\/]+[\\/][^\\/]+[\\/](updates\.jsonl|summary\.json)$/.test(String(filename))) return
+      if (grokTimer) clearTimeout(grokTimer)
+      grokTimer = setTimeout(() => {
+        grokTimer = null
+        win?.webContents.send('projects:changed')
+      }, 1500)
+    })
+    grokWatcher.on('error', () => {
+      grokWatcher?.close()
+      grokWatcher = null
+    })
+  } catch {
+    /* Grok not installed */
+  }
+  let codexTimer: NodeJS.Timeout | null = null
+  try {
+    // The thread index and Desktop's state file; Codex's log database in the same folder changes constantly.
+    codexWatcher = watch(CODEX_HOME, (_event, filename) => {
+      if (filename && !/^(state_\d+\.sqlite(-wal)?|\.codex-global-state\.json)$/.test(String(filename))) return
+      if (codexTimer) clearTimeout(codexTimer)
+      codexTimer = setTimeout(() => {
+        codexTimer = null
+        win?.webContents.send('projects:changed')
+      }, 1500)
+    })
+    codexWatcher.on('error', () => {
+      codexWatcher?.close()
+      codexWatcher = null
+    })
+  } catch {
+    /* Codex not installed */
+  }
 }
 
 /** Last pushed live state, so the renderer only hears about real changes (status files are rewritten often). */
@@ -211,19 +287,30 @@ const deletedNote = () => DELETED_NOTES[store.getUi(app.getLocale()).language ??
 
 function registerIpc(): void {
   ipcMain.handle('projects:list', async () => {
-    lastProjects = await index.scan()
+    const tasks = readMcpTasks()
+    const [claude, codex, grok] = await Promise.all([index.scan(), scanCodex(), grokIndex.scan(tasks)])
+    lastProjects = [...claude, ...codex, ...grok]
+    lastTasks = tasks
     void searchIndex.update(lastProjects)
     return lastProjects
   })
   ipcMain.handle('session:load', async (_e, projectKey: string, id: string) => {
     const hit = findSession(lastProjects, projectKey, id)
-    return hit ? loadSession(hit.project, hit.family, hit.version) : null
+    if (!hit) return null
+    if (isCodexKey(projectKey)) return loadCodexSession(hit.project, hit.family)
+    const detail = isGrokKey(projectKey)
+      ? await loadGrokSession(hit.project, hit.family, hit.version)
+      : await loadSession(hit.project, hit.family, hit.version)
+    return detail && addLinks(detail)
   })
   ipcMain.handle('session:loadAgent', async (_e, projectKey: string, fileId: string, agentId: string) => {
     const hit = findSession(lastProjects, projectKey, fileId)
-    return hit ? loadAgent(hit.version, agentId) : null
+    if (!hit || isCodexKey(projectKey)) return null
+    return isGrokKey(projectKey) ? loadGrokAgent(hit.version, agentId) : loadAgent(hit.version, agentId)
   })
-  ipcMain.handle('sessions:search', (_e, query: string, temp: boolean) => searchIndex.search(lastProjects, query, temp))
+  ipcMain.handle('sessions:search', (_e, query: string, temp: boolean, source: SessionSource) =>
+    searchIndex.search(lastProjects, query, temp, source),
+  )
   ipcMain.handle('session:rename', (_e, projectKey: string, id: string, title: string) =>
     renameSession(lastProjects, projectKey, id, title),
   )
@@ -256,6 +343,7 @@ function registerIpc(): void {
     await mkdir(dir, { recursive: true })
     await shell.openPath(dir)
   })
+  ipcMain.handle('project:openTerminal', (_e, projectKey: string) => openProjectInTerminal(lastProjects, projectKey))
   ipcMain.handle('session:openTerminal', (_e, projectKey: string, id: string) =>
     openInTerminal(lastProjects, projectKey, id),
   )
@@ -334,7 +422,7 @@ if (dataDirArg) {
 if (staleDataDir) {
   // No window or locale yet, so the message is bilingual.
   dialog.showErrorBox(
-    'CC History Manager',
+    'Agent History Manager',
     `数据目录的上级文件夹不存在，请检查快捷方式里的 --data-dir 参数。\n` +
       `The parent folder of the data folder doesn't exist. Check the --data-dir argument in the shortcut.\n\n${staleDataDir}`,
   )
@@ -349,10 +437,11 @@ if (staleDataDir) {
   })
 
   app.whenReady().then(() => {
-    app.setAppUserModelId('io.github.cigenb.cc-history-manager')
+    app.setAppUserModelId('io.github.cigenb.agent-history-manager')
     const userData = app.getPath('userData')
     store = new Store(join(userData, 'state.json'))
     index = new SessionIndex(join(userData, 'index-cache.json'))
+    grokIndex = new GrokIndex(join(userData, 'grok-index-cache.json'))
     registerIpc()
     createWindow()
     startWatching()
@@ -366,6 +455,8 @@ if (staleDataDir) {
 
   app.on('before-quit', () => {
     watcher?.close()
+    grokWatcher?.close()
+    codexWatcher?.close()
     liveWatcher?.close()
     if (liveInterval) clearInterval(liveInterval)
     store?.flush()

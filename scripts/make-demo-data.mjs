@@ -407,7 +407,7 @@ await write(
 console.log(`Demo data written to ${root}`)
 
 if (argv.includes('--launch')) {
-  const exe = join(repo, 'release', 'win-unpacked', 'CC History Manager.exe')
+  const exe = join(repo, 'release', 'win-unpacked', 'Agent History Manager.exe')
   if (!existsSync(exe)) {
     console.error('Build the app first: pnpm dist:dir')
     process.exit(1)

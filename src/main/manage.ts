@@ -1,8 +1,9 @@
-import { shell } from 'electron'
-import { spawn } from 'node:child_process'
+import { app, shell } from 'electron'
+import { execFile, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, promises as fs } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, sep } from 'node:path'
 import type {
   ActionResult,
   ActionError,
@@ -14,6 +15,28 @@ import type {
   ProjectSummary,
   SessionVersion,
 } from '../shared/types'
+import {
+  CODEX_GLOBAL_STATE,
+  CODEX_HOME,
+  codexDescendants,
+  codexExecutable,
+  codexThread,
+  forgetThreads,
+  isCodexKey,
+  readGlobalState,
+  type CodexThread,
+} from './codex'
+import {
+  findGrokSessionDir,
+  GROK_HOME,
+  GROK_MCP_DIR,
+  grokExecutable,
+  grokSessionDir,
+  isGrokKey,
+  readGrokAgents,
+  readMcpTasks,
+  type McpTask,
+} from './grok'
 import { findSession, projectMemoryDir, PROJECTS_DIR } from './sessions'
 
 const CLAUDE_DIR = join(homedir(), '.claude')
@@ -107,6 +130,8 @@ function targetVersions(projects: ProjectSummary[], target: DeleteTarget): Sessi
 }
 
 export async function planDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<DeletePlan> {
+  if (isGrokKey(target.projectKey)) return planGrokDelete(projects, target)
+  if (isCodexKey(target.projectKey)) return (await planCodexDelete(projects, target)).plan
   const versions = targetVersions(projects, target)
   const live = await liveSessionIds()
   const project = projects.find((p) => p.key === target.projectKey)
@@ -125,6 +150,8 @@ export async function runDelete(
   target: DeleteTarget,
   kinds: DeleteKind[],
 ): Promise<ActionResult> {
+  if (isGrokKey(target.projectKey)) return runGrokDelete(target)
+  if (isCodexKey(target.projectKey)) return runCodexDelete(projects, target, kinds)
   const plan = await planDelete(projects, target)
   if (plan.blocked) return { ok: false, error: plan.blocked }
   const failed: string[] = []
@@ -165,25 +192,14 @@ function withoutParentSession(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
- * Opens a Windows Terminal tab in the project directory running `claude --resume`. PowerShell stays open
- * after Claude exits so the tab does not vanish. Only for conversations not already open elsewhere.
+ * Opens a Windows Terminal tab in `cwd` running `command` in PowerShell, which stays open after Claude exits
+ * so the tab does not vanish.
  */
-export async function openInTerminal(
-  projects: ProjectSummary[],
-  projectKey: string,
-  id: string,
-): Promise<ActionResult> {
-  const hit = findSession(projects, projectKey, id)
-  if (!hit) return { ok: false, error: { code: 'session-missing' } }
-  const live = await liveSessionIds()
-  if (hit.family.versions.some((v) => live.has(v.id))) return { ok: false, error: OPEN_ERROR }
-  const cwd = hit.project.path
+async function launchInTerminal(cwd: string, command: string): Promise<ActionResult> {
   if (!existsSync(cwd)) return { ok: false, error: { code: 'directory-missing', path: cwd } }
   // wt.exe splits its whole command line at ';' into separate tabs; '\;' passes a literal semicolon.
   const wtArg = (s: string) => s.replace(/;/g, '\\;')
-  // Resume the primary file: it holds the most complete copy of the conversation.
-  const args = ['-d', wtArg(cwd), 'pwsh', '-NoExit', '-Command', `claude --resume ${hit.family.id}`]
-  const child = spawn('wt.exe', args, {
+  const child = spawn('wt.exe', ['-d', wtArg(cwd), 'pwsh', '-NoExit', '-Command', command], {
     env: withoutParentSession(process.env),
     detached: true,
     stdio: 'ignore',
@@ -197,6 +213,31 @@ export async function openInTerminal(
   })
 }
 
+/** `claude --resume` for a conversation not already open elsewhere. */
+export async function openInTerminal(
+  projects: ProjectSummary[],
+  projectKey: string,
+  id: string,
+): Promise<ActionResult> {
+  const hit = findSession(projects, projectKey, id)
+  if (!hit || isCodexKey(projectKey)) return { ok: false, error: { code: 'session-missing' } }
+  if (isGrokKey(projectKey)) {
+    if (await grokSessionBusy(id)) return { ok: false, error: { code: 'grok-session-open' } }
+    return launchInTerminal(hit.project.path, `grok --resume ${id}`)
+  }
+  const live = await liveSessionIds()
+  if (hit.family.versions.some((v) => live.has(v.id))) return { ok: false, error: OPEN_ERROR }
+  // Resume the primary file: it holds the most complete copy of the conversation.
+  return launchInTerminal(hit.project.path, `claude --resume ${hit.family.id}`)
+}
+
+/** A new Claude Code conversation in the project directory. */
+export async function openProjectInTerminal(projects: ProjectSummary[], projectKey: string): Promise<ActionResult> {
+  const project = projects.find((p) => p.key === projectKey)
+  if (!project || project.source === 'codex') return { ok: false, error: { code: 'project-missing' } }
+  return launchInTerminal(project.path, project.source === 'grok' ? 'grok' : 'claude')
+}
+
 /** Mirrors /rename: appends a custom-title record and rewrites <id>/custom-title.json. */
 export async function renameSession(
   projects: ProjectSummary[],
@@ -207,7 +248,7 @@ export async function renameSession(
   const name = title.trim()
   if (!name) return { ok: false, error: { code: 'name-empty' } }
   const hit = findSession(projects, projectKey, id)
-  if (!hit) return { ok: false, error: { code: 'session-missing' } }
+  if (!hit || isGrokKey(projectKey) || isCodexKey(projectKey)) return { ok: false, error: { code: 'session-missing' } }
   // The list shows the primary file's title, so that is the file to rename.
   const v = hit.family.versions.find((x) => x.id === hit.family.id) ?? hit.version
   // A running session re-appends its in-memory title and would undo the rename.
@@ -235,4 +276,363 @@ export async function renameSession(
   } catch (e) {
     return { ok: false, error: { code: 'rename-failed', detail: (e as Error).message } }
   }
+}
+
+// ---- Grok sessions ---------------------------------------------------------
+
+/**
+ * Whether a Grok process has the session open, from ~/.grok/active_sessions.json. Its row format is not
+ * documented, so any row mentioning the id counts, unless the row names a pid that has exited: Grok cannot
+ * prune rows of crashed processes on Windows.
+ */
+async function grokSessionOpen(id: string): Promise<boolean> {
+  let data: unknown
+  try {
+    data = JSON.parse(await fs.readFile(join(GROK_HOME, 'active_sessions.json'), 'utf8'))
+  } catch {
+    return false
+  }
+  const rows: [string, unknown][] = Array.isArray(data)
+    ? data.map((v) => ['', v])
+    : data && typeof data === 'object'
+      ? Object.entries(data)
+      : []
+  return rows.some(([key, value]) => {
+    if (!(key + JSON.stringify(value)).includes(id)) return false
+    const pid = (value as { pid?: unknown } | null)?.pid
+    return typeof pid !== 'number' || pidAlive(pid)
+  })
+}
+
+/** Open in Grok, or running as a Grok-MCP task: resuming or deleting it now would collide. */
+async function grokSessionBusy(id: string, tasks: McpTask[] = readMcpTasks()): Promise<boolean> {
+  return tasks.some((t) => t.sessionId === id && t.active) || (await grokSessionOpen(id))
+}
+
+interface Locator {
+  python: string
+  manage: string
+}
+
+/** Written by every Grok-MCP server start; deleting registered sessions goes through its manage.py. */
+async function grokMcpLocator(): Promise<Locator | null> {
+  try {
+    const l = JSON.parse(await fs.readFile(join(GROK_MCP_DIR, 'install.json'), 'utf8')) as Partial<Locator>
+    return l.python && l.manage && existsSync(l.manage) ? { python: l.python, manage: l.manage } : null
+  } catch {
+    return null
+  }
+}
+
+function run(file: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      file,
+      args,
+      { windowsHide: true, timeout: 120_000, env: { ...withoutParentSession(process.env), PYTHONUTF8: '1' } },
+      (error, stdout, stderr) => {
+        const code = error ? (typeof error.code === 'number' ? error.code : 1) : 0
+        resolve({ code, stdout: String(stdout), stderr: String(stderr || (error && code ? error.message : '')) })
+      },
+    )
+  })
+}
+
+const lastLine = (text: string): string => text.trim().split(/\r?\n/).pop() ?? ''
+
+/** Plans that runGrokDelete applies exactly as previewed, per target. */
+interface GrokDeleteJob {
+  /** Grok-MCP cleanup plans, one per client; manage.py refuses one whose files changed since */
+  mcp: { client: string; planFile: string; confirmation: string }[]
+  /** Sessions Grok-MCP does not know, with the child sessions of their subagents */
+  direct: { id: string; dir: string; children: { id: string; dir: string }[] }[]
+}
+
+const grokJobs = new Map<string, GrokDeleteJob>()
+const jobKey = (target: DeleteTarget): string => JSON.stringify(target)
+
+async function discardJob(key: string): Promise<void> {
+  const job = grokJobs.get(key)
+  grokJobs.delete(key)
+  for (const m of job?.mcp ?? []) await fs.rm(m.planFile, { force: true })
+}
+
+/**
+ * Grok sessions are deleted permanently: registered ones by Grok-MCP's cleanup (native sessions, task records,
+ * logs), the rest with `grok sessions delete`. Neither goes through the Recycle Bin.
+ */
+async function planGrokDelete(projects: ProjectSummary[], target: DeleteTarget): Promise<DeletePlan> {
+  const key = jobKey(target)
+  await discardJob(key)
+  const versions = targetVersions(projects, target)
+  const tasks = readMcpTasks()
+  const items: DeleteItem[] = []
+  const job: GrokDeleteJob = { mcp: [], direct: [] }
+  const blockedPlan = async (blocked: ActionError): Promise<DeletePlan> => {
+    for (const m of job.mcp) await fs.rm(m.planFile, { force: true })
+    return { items, blocked, mode: 'grok' }
+  }
+  for (const v of versions) {
+    if (await grokSessionBusy(v.id, tasks)) return blockedPlan({ code: 'grok-session-open' })
+  }
+
+  const registered = new Map(tasks.map((t) => [t.sessionId, t.client]))
+  for (const client of ['claude', 'codex'] as const) {
+    const ids = versions.filter((v) => registered.get(v.id) === client).map((v) => v.id)
+    if (!ids.length) continue
+    const locator = await grokMcpLocator()
+    if (!locator) return blockedPlan({ code: 'grok-mcp-missing' })
+    const planFile = join(tmpdir(), `cc-history-grok-${randomUUID()}.json`)
+    const r = await run(locator.python, [locator.manage, '--client', client, 'cleanup-plan', '--sessions', ...ids, '--out', planFile])
+    if (r.code !== 0) return blockedPlan({ code: 'grok-failed', detail: lastLine(r.stderr) })
+    const plan = JSON.parse(await fs.readFile(planFile, 'utf8')) as {
+      confirmation: string
+      files: { path: string; size: number }[]
+      native_directories: string[]
+      child_sessions: string[]
+      task_directories: string[]
+      log_files: string[]
+    }
+    job.mcp.push({ client, planFile, confirmation: plan.confirmation })
+    const bytes = (path: string) =>
+      plan.files.filter((f) => f.path === path || f.path.startsWith(path + sep)).reduce((n, f) => n + f.size, 0)
+    const children = new Set(plan.child_sessions)
+    for (const d of plan.native_directories) {
+      items.push({ path: d, bytes: bytes(d), kind: children.has(basename(d)) ? 'artifacts' : 'sessions' })
+    }
+    for (const d of [...plan.task_directories, ...plan.log_files]) items.push({ path: d, bytes: bytes(d), kind: 'mcp' })
+  }
+
+  for (const v of versions.filter((x) => !registered.has(x.id))) {
+    const dir = grokSessionDir(v)
+    const children: { id: string; dir: string }[] = []
+    for (const id of (await readGrokAgents(dir)).keys()) {
+      const childDir = await findGrokSessionDir(id)
+      if (childDir) children.push({ id, dir: childDir })
+    }
+    items.push({ path: dir, bytes: (await sizeOf(dir)) ?? 0, kind: 'sessions' })
+    for (const c of children) items.push({ path: c.dir, bytes: (await sizeOf(c.dir)) ?? 0, kind: 'artifacts' })
+    job.direct.push({ id: v.id, dir, children })
+  }
+  grokJobs.set(key, job)
+  return { items, mode: 'grok' }
+}
+
+async function runGrokDelete(target: DeleteTarget): Promise<ActionResult> {
+  const key = jobKey(target)
+  const job = grokJobs.get(key)
+  if (!job) return { ok: false, error: { code: 'session-missing' } }
+  for (const d of job.direct) {
+    if (await grokSessionBusy(d.id)) return { ok: false, error: { code: 'grok-session-open' } }
+  }
+  const failures: string[] = []
+  const locator = job.mcp.length ? await grokMcpLocator() : null
+  for (const m of job.mcp) {
+    const r = locator
+      ? await run(locator.python, [locator.manage, '--client', m.client, 'cleanup', m.planFile, '--confirm', m.confirmation])
+      : { code: 1, stdout: '', stderr: 'Grok-MCP install.json is missing' }
+    if (r.code !== 0) failures.push(lastLine(r.stderr))
+  }
+  for (const d of job.direct) {
+    for (const s of [d, ...d.children]) {
+      const r = await run(grokExecutable(), ['sessions', 'delete', s.id])
+      if (!existsSync(s.dir)) continue
+      // The CLI skips the local folders of hidden subagent sessions; those go to the Recycle Bin instead.
+      if (s === d) failures.push(lastLine(r.stderr || r.stdout) || s.dir)
+      else await shell.trashItem(s.dir).catch(() => failures.push(s.dir))
+    }
+  }
+  await discardJob(key)
+  return failures.length ? { ok: false, error: { code: 'grok-failed', detail: failures.join('\n') } } : { ok: true }
+}
+
+// ---- Codex threads ---------------------------------------------------------
+
+/**
+ * Codex Desktop (the MSIX app's Codex.exe) keeps its state file in memory and writes it back, which would
+ * restore entries removed while it runs. Its bundled CLI is also named codex.exe, so the path decides.
+ * When the check itself fails, Desktop counts as running.
+ */
+function codexDesktopRunning(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "Name='Codex.exe'" | ForEach-Object { "$($_.ExecutablePath) $($_.CommandLine)" }`,
+      ],
+      { windowsHide: true, timeout: 30_000 },
+      (error, stdout) => resolve(!!error || /\\WindowsApps\\OpenAI\.Codex_/i.test(String(stdout))),
+    )
+  })
+}
+
+interface RpcMessage {
+  id?: number
+  method?: string
+  error?: { message?: string }
+}
+
+/**
+ * Deletes threads through Codex's own app-server `thread/delete`: the rollout file and the thread's rows in
+ * Codex's databases (index, history projection, logs), subagent threads included. Returns the failures.
+ */
+function codexDeleteThreads(ids: string[]): Promise<string[]> {
+  return new Promise((resolve) => {
+    const child = spawn(codexExecutable(), ['app-server'], {
+      env: withoutParentSession(process.env),
+      stdio: ['pipe', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+    const waiting = new Map<number, (m: RpcMessage) => void>()
+    const fail = (reason: string) => {
+      for (const done of waiting.values()) done({ error: { message: reason } })
+      waiting.clear()
+    }
+    let buffer = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk
+      for (let nl = buffer.indexOf('\n'); nl !== -1; nl = buffer.indexOf('\n')) {
+        const line = buffer.slice(0, nl)
+        buffer = buffer.slice(nl + 1)
+        let m: RpcMessage
+        try {
+          m = JSON.parse(line) as RpcMessage
+        } catch {
+          continue
+        }
+        if (m.id === undefined) continue
+        if (m.method) {
+          // A request from the server (approval, input) has no one to answer it here.
+          child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'unavailable' } }) + '\n')
+          continue
+        }
+        waiting.get(m.id)?.(m)
+        waiting.delete(m.id)
+      }
+    })
+    child.on('error', (e) => fail(e.message))
+    child.on('exit', () => fail('Codex app-server exited'))
+    let seq = 0
+    const call = (method: string, params: unknown) =>
+      new Promise<RpcMessage>((done) => {
+        const id = ++seq
+        waiting.set(id, done)
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+      })
+    const timer = setTimeout(() => {
+      fail('timed out')
+      child.kill()
+    }, 120_000)
+    void (async () => {
+      const failures: string[] = []
+      const init = await call('initialize', { clientInfo: { name: 'agent-history-manager', version: app.getVersion() } })
+      if (init.error) failures.push(init.error.message || 'initialize failed')
+      else {
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'initialized' }) + '\n')
+        for (const id of ids) {
+          const r = await call('thread/delete', { threadId: id })
+          if (r.error) failures.push(`${id}: ${r.error.message ?? 'failed'}`)
+        }
+      }
+      clearTimeout(timer)
+      child.stdin.end()
+      resolve(failures)
+    })()
+  })
+}
+
+const backupRoot = () => join(app.getPath('userData'), 'codex-backups', new Date().toISOString().replace(/[:.]/g, '-'))
+
+/**
+ * Removes the threads from Codex Desktop's state file (and its .bak copy) and from the name and prompt indexes.
+ * Each changed file is copied to a backup folder first and replaced atomically.
+ */
+async function forgetCodexThreads(ids: string[]): Promise<string[]> {
+  const failures: string[] = []
+  const dir = backupRoot()
+  const replace = async (file: string, next: string) => {
+    await fs.mkdir(dir, { recursive: true })
+    await fs.copyFile(file, join(dir, basename(file)))
+    const temp = `${file}.${process.pid}.tmp`
+    await fs.writeFile(temp, next)
+    await fs.rename(temp, file)
+  }
+  for (const file of [CODEX_GLOBAL_STATE, CODEX_GLOBAL_STATE + '.bak']) {
+    try {
+      if (!existsSync(file)) continue
+      const { value, removed } = forgetThreads(JSON.parse(await fs.readFile(file, 'utf8')), ids)
+      if (removed) await replace(file, JSON.stringify(value))
+    } catch {
+      failures.push(file)
+    }
+  }
+  for (const name of ['session_index.jsonl', 'history.jsonl']) {
+    const file = join(CODEX_HOME, name)
+    try {
+      if (!existsSync(file)) continue
+      const lines = (await fs.readFile(file, 'utf8')).split('\n')
+      const kept = lines.filter((l) => !ids.some((id) => l.includes(id)))
+      if (kept.length !== lines.length) await replace(file, kept.join('\n'))
+    } catch {
+      failures.push(file)
+    }
+  }
+  return failures
+}
+
+/** Threads to delete with what goes with them; recomputed for every run, never taken from the renderer. */
+async function planCodexDelete(
+  projects: ProjectSummary[],
+  target: DeleteTarget,
+): Promise<{ plan: DeletePlan; top: string[]; all: string[]; files: DeleteItem[] }> {
+  const top = targetVersions(projects, target).map((v) => v.id)
+  const threads = [...top.map(codexThread).filter((t): t is CodexThread => !!t), ...codexDescendants(top)]
+  const all = threads.map((t) => t.id)
+  const state = await readGlobalState()
+  const items: DeleteItem[] = []
+  for (const t of threads) {
+    if (t.rolloutPath) {
+      const bytes = await sizeOf(t.rolloutPath)
+      if (bytes !== null) items.push({ path: t.rolloutPath, bytes, kind: 'sessions' })
+    }
+  }
+  if (forgetThreads(state, all).removed) items.push({ path: CODEX_GLOBAL_STATE, bytes: 0, kind: 'sessions' })
+  const files: DeleteItem[] = []
+  for (const id of all) {
+    const images = join(CODEX_HOME, 'generated_images', id)
+    const bytes = await sizeOf(images)
+    if (bytes !== null) files.push({ path: images, bytes, kind: 'artifacts' })
+  }
+  // A projectless thread works in a folder Desktop created for it alone; never one another thread still uses.
+  const outputs = state['thread-projectless-output-directories'] ?? {}
+  const remaining = projects.flatMap((p) => (p.source === 'codex' ? p.sessions : [])).filter((s) => !top.includes(s.id))
+  for (const id of top) {
+    const dir = outputs[id]
+    if (!dir || !(state['projectless-thread-ids'] ?? []).includes(id)) continue
+    const shared = remaining.some((s) => outputs[s.id] && outputs[s.id].toLowerCase() === dir.toLowerCase())
+    const bytes = shared ? null : await sizeOf(dir)
+    if (bytes !== null) files.push({ path: dir, bytes, kind: 'output' })
+  }
+  items.push(...files)
+  const blocked: ActionError | undefined = (await codexDesktopRunning()) ? { code: 'codex-running' } : undefined
+  return { plan: { items, blocked, mode: 'codex' }, top, all, files }
+}
+
+async function runCodexDelete(projects: ProjectSummary[], target: DeleteTarget, kinds: DeleteKind[]): Promise<ActionResult> {
+  const { plan, top, all, files } = await planCodexDelete(projects, target)
+  if (plan.blocked) return { ok: false, error: plan.blocked }
+  const failures: string[] = []
+  if (kinds.includes('sessions') && top.length) {
+    failures.push(...(await codexDeleteThreads(top)))
+    // Desktop's entries go only once Codex has deleted the threads themselves.
+    if (!failures.length) failures.push(...(await forgetCodexThreads(all)))
+  }
+  for (const { path } of files.filter((f) => kinds.includes(f.kind))) {
+    await shell.trashItem(path).catch(() => failures.push(path))
+  }
+  return failures.length ? { ok: false, error: { code: 'codex-failed', detail: failures.join('\n') } } : { ok: true }
 }
